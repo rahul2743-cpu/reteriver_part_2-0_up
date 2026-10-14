@@ -3,7 +3,7 @@
 #   B1. top-K chunks (max 3 per doc, weak chunks + near-duplicates dropped)
 #   B2. build_context = top relationships + top-K chunks (neighbours merged)
 #   B3. anti-hallucination prompt
-#   B4. LLM answer + sources (cited IDs checked against the context)
+#   B4. LLM answer + sources (IDs used inside only, removed from the final answer)
 # Main function: kg_answer(question, verbose=True) -> dict
 # Needs: retrieve_chunks (Cell 17A), driver_llm (your LLM, temperature 0)
 # ==============================================================================
@@ -25,7 +25,7 @@ from an engineering wiki and its knowledge graph. If something is not in the con
 you do not know it.
 
 --- CONTEXT ---
-[C#] DOCUMENT TEXT: exact wiki text with the page title. Primary evidence.
+[C#] DOCUMENT TEXT: exact wiki text, after the page title. Primary evidence.
 [R#] RELATIONSHIPS: Source --[predicate, strength 1-10]--> Target : explanation. Supporting hints.
 
 --- RULES ---
@@ -43,11 +43,8 @@ you do not know it.
 8. Be concise. No preamble, no outside knowledge.
 
 --- OUTPUT ---
-Answer:
-<answer, every sentence cited>
-
-Sources:
-- <page title> [C#]"""
+Write only the answer, every sentence ending with its ID(s).
+Do not write a "Sources" list - it is added automatically."""
 
 def _words(t):
     return set(re.findall(r"[a-z0-9]+", t.lower()))
@@ -110,7 +107,7 @@ def build_context(chunks, relationships):
     text_budget = MAX_CONTEXT_CHARS - REL_CHARS
     for b in _blocks(chunks):                          # best text first, until the budget
         cid = f"C{len(chunk_lines) + 1}"
-        block = f"[{cid}] ({b['doc_label']} - part {b['parts']})\n{b['text'][:text_budget - 200]}\n"
+        block = f"[{cid}] {b['doc_label']}\n{b['text'][:text_budget - 200]}\n"
         if used + len(block) > text_budget:
             continue
         chunk_lines.append(block); ids[cid] = b; used += len(block)
@@ -131,37 +128,47 @@ def build_context(chunks, relationships):
     return context, ids
 
 # ---------------------------------------------------------------- B3 + B4
+_ID = re.compile(r"\s*\[\s*[CR]\d+(?:\s*,\s*[CR]\d+)*\s*\]")
+
+def clean_answer(raw):
+    """Remove 'Answer:', any Sources list the LLM wrote, and all [C#]/[R#] IDs."""
+    raw = re.split(r"\n\s*\**sources?\**\s*:", raw, flags=re.I)[0]
+    raw = re.sub(r"^\s*\**answer\**\s*:\s*", "", raw, flags=re.I)
+    txt = _ID.sub("", raw)
+    txt = re.sub(r"[ \t]+([.,;:!?])", r"\1", txt)
+    return re.sub(r"[ \t]{2,}", " ", txt).strip()
+
 def kg_answer(question, verbose=True):
     r = retrieve_chunks(question, verbose=False)
     k = choose_k(question, r["phrases"], r["ranked_chunks"]) if r["ranked_chunks"] else 0
     top = select_top_chunks(r["ranked_chunks"], k)
     context, ids = build_context(top, r["relationships"])
-    out = {"question": question, "answer": "The provided documents do not contain this information.",
-           "sources": [], "cited": [], "invalid_ids": [], "k": k, "top_chunks": top,
-           "context": context, "retrieval": r}
+    nf = "The provided documents do not contain this information."
+    out = {"question": question, "answer": nf, "raw_answer": nf, "sources": [], "cited": [],
+           "invalid_ids": [], "k": k, "top_chunks": top, "context": context, "retrieval": r}
     if top:
         try:
             resp = driver_llm.invoke([
                 {"role": "system", "content": ANSWER_PROMPT},
                 {"role": "user", "content": f"{context}\n\n---QUESTION---\n{question}"}])
-            out["answer"] = resp.content.strip()
+            out["raw_answer"] = resp.content.strip()             # with IDs (for checking)
         except Exception as e:
-            out["answer"] = f"[generation failed: {e}]"
-        found = set(re.findall(r"\[([CR]\d+)\]", out["answer"]))
+            out["raw_answer"] = f"[generation failed: {e}]"
+        found = set(re.findall(r"[CR]\d+", " ".join(re.findall(r"\[[^\]]*\]", out["raw_answer"]))))
         out["cited"] = sorted(found & set(ids), key=lambda x: (x[0], int(x[1:])))
         out["invalid_ids"] = sorted(found - set(ids))           # IDs the LLM invented
         out["sources"] = list(dict.fromkeys(ids[i]["doc_label"] for i in out["cited"] if i[0] == "C"))
+        out["answer"] = clean_answer(out["raw_answer"])          # clean text for the user
     if verbose:
         n_c = sum(i[0] == "C" for i in ids)
         print(f"\nQ : {question}")
-        print(f"  seeds   : {[l for _, l, _, _ in r['seeds']][:5]}")
         print(f"  chunks  : {len(r['ranked_chunks'])} ranked, K={k} -> {len(top)} chosen "
-              f"-> {n_c} text blocks from {len({c['doc_uri'] for c in top})} docs")
-        print(f"  context : {len(context)} chars (~{len(context) // 4} tokens), "
-              f"{len(ids) - n_c} relationships")
-        print(f"  cited   : {out['cited']}"
-              + (f"   INVALID IDs: {out['invalid_ids']}" if out["invalid_ids"] else ""))
-        print(f"  sources : {out['sources']}\n\nANSWER:\n{out['answer']}")
+              f"-> {n_c} text blocks, {len(ids) - n_c} relationships, {len(context)} chars")
+        if out["invalid_ids"]:
+            print(f"  WARNING : LLM used IDs not in the context: {out['invalid_ids']}")
+        print(f"\nANSWER:\n{out['answer']}")
+        if out["sources"]:
+            print("\nSources:\n" + "\n".join(f"- {s}" for s in out["sources"]))
     return out
 
 print(f"Defined: kg_answer  (K={TOP_K_MIN}-{TOP_K_MAX}, max {MAX_PER_DOC}/doc, "
