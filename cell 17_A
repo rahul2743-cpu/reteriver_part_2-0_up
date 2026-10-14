@@ -1,0 +1,597 @@
+# ==============================================================================
+# CELL 17A - RETRIEVE & RANK CHUNKS  (subgraph -> documents -> chunks -> PageRank)
+# ==============================================================================
+#   A1. Pick the documents in the query sub-graph
+#       (seed docs + parent docs of entity seeds + hop-1/hop-2 docs + inline links)
+#   A2. Fetch their content (one SPARQL call per batch)
+#   A3. Chunk each document (cached, so each document is chunked only once)
+#   A4. For EACH document: standard PageRank over a graph of its chunks + the
+#       query words -> keep the best CHUNKS_PER_DOC (3-4)
+#   A5. Standard PageRank over ALL kept chunks + the KG sub-graph
+#       -> final chunk score = PageRank
+#   Ranking = standard PageRank only:  PR(i) = (1-d)/N + d * SUM PR(j)/L(j)
+#   computed iteratively until the scores stop changing.
+#
+# Main function:  retrieve_chunks(question, verbose=True) -> dict
+# Needs from earlier cells: g, PREFIXES, CONTENT_NODES, NODE_LABEL,
+#   LABEL_TO_NODES, DOC_CONTENT_TMPL, extract_query_entities (Cell 15),
+#   link_entities, traverse, content_search, lexical_fallback (Cell 16)
+# ==============================================================================
+import math
+import re
+from collections import defaultdict, Counter
+
+print("=" * 80)
+print("CELL 17A - RETRIEVE & RANK CHUNKS")
+print("=" * 80)
+
+_REQ_17A = ["g", "PREFIXES", "CONTENT_NODES", "NODE_LABEL", "LABEL_TO_NODES",
+            "DOC_CONTENT_TMPL", "extract_query_entities", "link_entities",
+            "traverse", "content_search", "lexical_fallback"]
+_miss_17A = [n for n in _REQ_17A if n not in globals()]
+if _miss_17A:
+    raise NameError(f"Run Cell 15 and Cell 16 first - not defined: {_miss_17A}")
+
+# ------------------------------------------------------------------------------
+# Settings
+# ------------------------------------------------------------------------------
+MAX_SUBGRAPH_DOCS = 15        # documents taken from the sub-graph (seed docs always kept)
+PARENT_DOCS_PER_ENT = 2       # entity seed -> its strongest parent documents
+MAX_INLINE_DOCS   = 3         # extra docs reached through <EntityName> links in the text
+
+CHUNK_CHARS     = 900         # target chunk size (characters)
+CHUNK_OVERLAP   = 150         # characters repeated from the previous chunk
+MIN_CHUNK_CHARS = 120         # smaller pieces are merged / dropped
+USE_KG_CHUNKS   = True        # reuse KG_CHUNKS[uri] if an earlier cell built it
+
+CHUNKS_PER_DOC     = 4        # A4: chunks kept per document (3-4)
+KEEP_SEED_FALLBACK = True     # a seed doc keeps its first chunk even if no query word matches
+
+# --- standard PageRank:  PR(i) = (1-d)/N + d * SUM PR(j)/L(j) ---
+PR_DAMPING   = 0.85           # d
+PR_TOL       = 1e-8           # stop when the total change is smaller than this
+PR_MAX_ITER  = 200
+SIM_NEIGHBOURS, MIN_SIM = 3, 0.08   # A4: link each chunk to its 3 most similar chunks
+
+HOP_PRIOR = {0: 1.0, 1: 0.7, 2: globals().get("HOP_DECAY", 0.45)}   # used for A1 doc choice only
+
+# ------------------------------------------------------------------------------
+# Plain-str views of the lookup tables (rdflib URIRef != str)
+# ------------------------------------------------------------------------------
+_DOCS17   = {str(n) for n in CONTENT_NODES}
+_LABEL17  = {str(k): str(v) for k, v in NODE_LABEL.items()}
+_L2N17    = {str(k).lower(): [str(n) for n in v] for k, v in LABEL_TO_NODES.items()}
+_CHUNK_CACHE = {}             # uri -> [chunk dicts]   (A3 runs once per document)
+
+_STOP17 = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is", "are",
+           "be", "it", "as", "at", "by", "with", "from", "that", "this", "these", "those",
+           "what", "which", "who", "how", "when", "where", "why", "does", "do", "can",
+           "should", "will", "would", "into", "about", "there", "their", "its", "was",
+           "were", "has", "have", "had", "not", "all", "any", "apply", "used", "use"}
+_IRI_BAD = re.compile(r'[\s<>"{}|^`\\]')
+_INLINE_RE = re.compile(r"<([A-Za-z][^<>\n]{1,79})>")
+
+def _tok(text):
+    """lower-case words, no stop words, light plural stemming."""
+    out = []
+    for t in re.findall(r"[a-z0-9]+", (text or "").lower()):
+        if len(t) < 2 or t in _STOP17:
+            continue
+        if len(t) > 4 and t.endswith("s") and not t.endswith("ss"):
+            t = t[:-1]
+        out.append(t)
+    return out
+
+def _values(uris):
+    return " ".join(f"<{u}>" for u in uris if u and not _IRI_BAD.search(u))
+
+def _int(x, d=0):
+    try:
+        return int(float(str(x)))
+    except (TypeError, ValueError):
+        return d
+
+# ------------------------------------------------------------------------------
+# Seeds + sub-graph (Cell 16)
+# ------------------------------------------------------------------------------
+def get_seeds(question, verbose=True):
+    """Cell 15 entity extraction -> Cell 16 linking, plus the two fallbacks."""
+    phrases = extract_query_entities(question) or []
+    seeds = link_entities(phrases) if phrases else []
+    seeds = [(str(n), l, float(s), p) for n, l, s, p in seeds]
+    matched = {p for _, _, _, p in seeds}
+    for phrase, _lbl in phrases:                       # content fallback per unmatched phrase
+        if phrase not in matched:
+            extra = [(str(n), l, float(s), p) for n, l, s, p in content_search(phrase, limit=3)]
+            seeds += [x for x in extra if x[0] not in {s[0] for s in seeds}]
+            if verbose and extra:
+                print(f"  content fallback for {phrase!r}: {[l for _, l, _, _ in extra]}")
+    fallback = False
+    if not seeds:
+        seeds = [(str(n), l, float(s), p) for n, l, s, p in lexical_fallback(question)]
+        fallback = True
+    return phrases, seeds, fallback
+
+_PARENT17_TMPL = PREFIXES + """
+SELECT ?src ?tgt ?strength
+WHERE {
+  VALUES ?tgt { %ENTS% }
+  ?stmt a rdf:Statement ;
+        rdf:subject ?src ;
+        rdf:object  ?tgt ;
+        ex:strength ?strength .
+  FILTER EXISTS { ?src ex:documentContent ?anyContent }
+}
+"""
+
+def _parent_docs(entity_uris):
+    """Strongest documents linking TO each entity seed: [(doc, entity, strength)]."""
+    block = _values(entity_uris)
+    if not block:
+        return []
+    try:
+        rows = list(g.query(_PARENT17_TMPL.replace("%ENTS%", block)))
+    except Exception as e:
+        print(f"  parent-doc query failed: {e}")
+        return []
+    best = {}
+    for r in rows:
+        key = (str(r.src), str(r.tgt))
+        best[key] = max(best.get(key, 0), _int(r.strength))
+    out, per_ent = [], defaultdict(int)
+    for (doc, ent), st in sorted(best.items(), key=lambda kv: -kv[1]):
+        if doc in _DOCS17 and per_ent[ent] < PARENT_DOCS_PER_ENT:
+            out.append((doc, ent, st))
+            per_ent[ent] += 1
+    return out
+
+# ------------------------------------------------------------------------------
+# A1. Pick the documents
+# ------------------------------------------------------------------------------
+def select_documents(seeds, edges, visited):
+    """Returns ({doc_uri: info}, doc_links) where info = {hop, is_seed, evidence}
+    and doc_links = {(docA, nodeB): max strength} from the KG edges."""
+    visited = {str(k): v for k, v in (visited or {}).items()}
+    doc_links = defaultdict(int)
+    for e in edges:
+        k = (str(e["source"]), str(e["target"]))
+        doc_links[k] = max(doc_links[k], _int(e.get("strength", 0)))
+
+    docs = {}
+    def _add(uri, hop, is_seed=False, ev=0.0):
+        if uri not in _DOCS17:
+            return
+        d = docs.setdefault(uri, {"hop": hop, "is_seed": is_seed, "evidence": 0.0})
+        d["hop"] = min(d["hop"], hop)
+        d["is_seed"] = d["is_seed"] or is_seed
+        d["evidence"] += ev
+
+    for n, _l, _s, _p in seeds:                       # seed documents
+        _add(n, 0, is_seed=True)
+    ent_seeds = [n for n, _l, _s, _p in seeds if n not in _DOCS17]
+    for doc, ent, st in _parent_docs(ent_seeds):      # entity seed -> parent documents
+        _add(doc, 0, is_seed=True, ev=st / 10.0)
+        doc_links[(doc, ent)] = max(doc_links[(doc, ent)], st)
+    for n, (hop, _sc) in visited.items():             # hop-1 / hop-2 documents
+        _add(n, min(int(hop), 2))
+    for e in edges:                                    # edge evidence per document
+        w = _int(e.get("strength", 0)) / 10.0 * HOP_PRIOR.get(min(int(e.get("hop", 1)), 2), 0.45)
+        for side in ("source", "target"):
+            if str(e[side]) in docs:
+                docs[str(e[side])]["evidence"] += w
+
+    seeds_first = [u for u, d in docs.items() if d["is_seed"]]
+    others = sorted((u for u, d in docs.items() if not d["is_seed"]),
+                    key=lambda u: -HOP_PRIOR.get(docs[u]["hop"], 0.45) * (1 + docs[u]["evidence"]))
+    keep = seeds_first + others[:max(0, MAX_SUBGRAPH_DOCS - len(seeds_first))]
+    return {u: docs[u] for u in keep}, dict(doc_links)
+
+# ------------------------------------------------------------------------------
+# A2. Fetch content
+# ------------------------------------------------------------------------------
+def fetch_doc_texts(uris, batch=40):
+    """{uri: {"label", "content"}}. Works with either %DOCS% or $DOCS$ in
+    DOC_CONTENT_TMPL, so it fits the Cell 16 you keep."""
+    out, uris = {}, [u for u in uris if u]
+    for i in range(0, len(uris), batch):
+        block = _values(uris[i:i + batch])
+        if not block:
+            continue
+        q = DOC_CONTENT_TMPL.replace("%DOCS%", block).replace("$DOCS$", block)
+        try:
+            for r in g.query(q):
+                u = str(r.doc)
+                if u not in out or len(str(r.content)) > len(out[u]["content"]):
+                    out[u] = {"label": str(r.label) if r.label else _LABEL17.get(u, u),
+                              "content": str(r.content)}
+        except Exception as e:
+            print(f"  document fetch failed: {e}")
+    return out
+
+def add_inline_link_docs(docs, texts):
+    """<EntityName> markers in hop-0/1 documents -> linked documents not yet chosen."""
+    count, parent_hop = Counter(), {}
+    for u, d in docs.items():
+        if d["hop"] > 1 or u not in texts:
+            continue
+        for m in _INLINE_RE.finditer(texts[u]["content"]):
+            for n in _L2N17.get(m.group(1).strip().lower(), []):
+                if n in _DOCS17 and n not in docs:
+                    count[n] += 1
+                    parent_hop[n] = min(parent_hop.get(n, 9), d["hop"])
+    new = [n for n, _ in count.most_common(MAX_INLINE_DOCS)]
+    for n in new:
+        docs[n] = {"hop": min(parent_hop[n] + 1, 2), "is_seed": False,
+                   "evidence": float(count[n]), "via_inline": True}
+    if new:
+        texts.update(fetch_doc_texts(new))
+    return new
+
+# ------------------------------------------------------------------------------
+# A3. Chunk
+# ------------------------------------------------------------------------------
+def _split_long(par, size):
+    """Split one long paragraph at sentence ends, then hard-cut if needed."""
+    parts, cur = [], ""
+    for s in re.split(r"(?<=[.!?;])\s+", par):
+        if len(cur) + len(s) + 1 <= size:
+            cur = (cur + " " + s).strip()
+        else:
+            if cur:
+                parts.append(cur)
+            while len(s) > size:
+                parts.append(s[:size]); s = s[size:]
+            cur = s
+    if cur:
+        parts.append(cur)
+    return parts
+
+def chunk_text(text, size=None, overlap=None, min_size=None):
+    """Paragraph-aware chunks of ~size chars; sentences are never cut unless one
+    sentence alone is longer than size. Settings are read at call time."""
+    size = size or CHUNK_CHARS
+    overlap = CHUNK_OVERLAP if overlap is None else overlap
+    min_size = MIN_CHUNK_CHARS if min_size is None else min_size
+    paras = [p.strip() for p in re.split(r"\n\s*\n|\n", text or "") if p.strip()]
+    merged, head = [], ""                            # keep a heading with its text
+    for p in paras:
+        if len(p) < 80 and not re.search(r"[.!?;:]$", p):
+            head = (head + "\n" + p).strip()
+            continue
+        merged.append((head + "\n" + p).strip() if head else p)
+        head = ""
+    if head:
+        merged.append(head)
+    pieces = []
+    for p in merged:
+        pieces.extend(_split_long(p, size) if len(p) > size else [p])
+    chunks, cur = [], ""
+    for p in pieces:
+        if cur and len(cur) + len(p) + 1 > size:
+            chunks.append(cur); cur = p
+        else:
+            cur = (cur + "\n" + p).strip()
+    if cur:
+        if chunks and len(cur) < min_size:
+            chunks[-1] = chunks[-1] + "\n" + cur
+        else:
+            chunks.append(cur)
+    if overlap and len(chunks) > 1:                  # carry a tail of the previous chunk
+        out = [chunks[0]]
+        for prev, c in zip(chunks, chunks[1:]):
+            tail = prev[-overlap:]
+            tail = tail[tail.find(" ") + 1:] if " " in tail else tail
+            out.append(tail + " " + c)
+        chunks = out
+    return chunks
+
+def get_chunks(uri, label, content):
+    if uri in _CHUNK_CACHE:
+        return _CHUNK_CACHE[uri]
+    texts = None
+    if USE_KG_CHUNKS and "KG_CHUNKS" in globals() and uri in KG_CHUNKS:
+        texts = [c.get("content", "") if isinstance(c, dict) else str(c) for c in KG_CHUNKS[uri]]
+        texts = [t for t in texts if t.strip()]
+    if not texts:
+        texts = chunk_text(content)
+    _CHUNK_CACHE[uri] = [{"doc_uri": uri, "doc_label": label, "index": i, "n_chunks": len(texts),
+                          "text": t, "tokens": _tok(label + " " + t)}
+                         for i, t in enumerate(texts)]
+    return _CHUNK_CACHE[uri]
+
+# ------------------------------------------------------------------------------
+# STANDARD PageRank (power iteration)
+#
+#     PR(i) = (1 - d) / N  +  d * SUM_{j in M(i)}  PR(j) / L(j)
+#
+#     d    = damping factor (PR_DAMPING, 0.85)
+#     N    = number of nodes in the graph
+#     M(i) = nodes that link TO i
+#     L(j) = number of outgoing links of j
+#   A node with no outgoing links ("dangling") shares its score equally with
+#   all N nodes (the usual convention, same as networkx).
+#   Repeated until the scores stop changing (sum |PR_new - PR_old| < PR_TOL).
+# ------------------------------------------------------------------------------
+def _link(graph, a, b, both=True):
+    """Add the link a -> b (and b -> a if both).  Links are unweighted."""
+    if a == b:
+        return
+    graph[a].add(b)
+    graph[b]                                   # make sure b exists as a node
+    if both:
+        graph[b].add(a)
+
+def pagerank(graph, d=None, tol=None, max_iter=None):
+    """graph = {node: set(of nodes it links to)}.  Returns (PR, iterations)."""
+    d = PR_DAMPING if d is None else d
+    tol = PR_TOL if tol is None else tol
+    max_iter = max_iter or PR_MAX_ITER
+    nodes = list(graph)
+    N = len(nodes)
+    if N == 0:
+        return {}, 0
+    incoming = defaultdict(list)               # M(i)
+    for j in nodes:
+        for i in graph[j]:
+            incoming[i].append(j)
+    L = {j: len(graph[j]) for j in nodes}      # L(j)
+    dangling = [j for j in nodes if L[j] == 0]
+    pr = {n: 1.0 / N for n in nodes}           # start: equal score everywhere
+    for it in range(1, max_iter + 1):
+        dang = d * sum(pr[j] for j in dangling) / N
+        new = {i: (1 - d) / N + dang + d * sum(pr[j] / L[j] for j in incoming[i])
+               for i in nodes}
+        diff = sum(abs(new[n] - pr[n]) for n in nodes)
+        pr = new
+        if diff < tol:
+            return pr, it
+    return pr, max_iter
+
+def query_nodes(question, phrases):
+    """The query as graph nodes: its words and its multi-word phrases."""
+    terms = set(_tok(question + " " + " ".join(p for p, _ in phrases)))
+    phrase_lc = sorted({p.lower() for p, _ in phrases if len(p.split()) > 1})
+    return terms, phrase_lc
+
+def _link_query(graph, chunk_node, chunk, terms, phrase_lc):
+    """QUERY <-> word <-> chunk that contains the word (same for phrases).
+    Returns how many query words/phrases the chunk contains."""
+    toks, low, hits = set(chunk["tokens"]), chunk["text"].lower(), 0
+    for t in terms:
+        if t in toks:
+            _link(graph, f"q:{t}", chunk_node)
+            hits += 1
+    for p in phrase_lc:
+        if p in low:
+            _link(graph, f"p:{p}", chunk_node)
+            hits += 1
+    return hits
+
+def _query_hub(graph, terms, phrase_lc):
+    """One QUERY node linked both ways to every query word and phrase."""
+    graph["QUERY"]
+    for t in terms:
+        _link(graph, "QUERY", f"q:{t}")
+    for p in phrase_lc:
+        _link(graph, "QUERY", f"p:{p}")
+
+# ------------------------------------------------------------------------------
+# A4. For EACH document: PageRank over its chunks, keep the best 3-4
+# ------------------------------------------------------------------------------
+def rank_chunks_in_doc(chunks, terms, phrase_lc):
+    """Graph of ONE document (all links unweighted, both directions):
+         QUERY <-> query word / phrase
+         query word / phrase <-> chunk that contains it
+         chunk <-> next chunk                (reading order)
+         chunk <-> its SIM_NEIGHBOURS most similar chunks (word overlap)
+    Score flows QUERY -> words -> chunks, so chunks holding more query words
+    (and next to such chunks) get a higher standard PageRank."""
+    graph = defaultdict(set)
+    _query_hub(graph, terms, phrase_lc)
+    hits = {}
+    for c in chunks:
+        node = f"c:{c['index']}"
+        graph[node]
+        hits[c["index"]] = _link_query(graph, node, c, terms, phrase_lc)
+    idx = sorted(c["index"] for c in chunks)
+    for i, k in zip(idx, idx[1:]):
+        if k == i + 1:
+            _link(graph, f"c:{i}", f"c:{k}")
+    sets = {c["index"]: set(c["tokens"]) for c in chunks}
+    for c in chunks:
+        a = sets[c["index"]]
+        sims = []
+        for o in chunks:
+            if o["index"] != c["index"] and a:
+                b = sets[o["index"]]
+                j = len(a & b) / len(a | b) if (a | b) else 0.0
+                if j >= MIN_SIM:
+                    sims.append((j, o["index"]))
+        for _j, oi in sorted(sims, reverse=True)[:SIM_NEIGHBOURS]:
+            _link(graph, f"c:{c['index']}", f"c:{oi}")
+    pr, iters = pagerank(graph)
+    return {c["index"]: pr.get(f"c:{c['index']}", 0.0) for c in chunks}, hits, iters
+
+def pick_chunks_per_doc(question, phrases, docs, texts):
+    """Document after document: standard PageRank inside it, keep the best 3-4
+    chunks that contain at least one query word."""
+    terms, phrase_lc = query_nodes(question, phrases)
+    candidates, per_doc_log = [], {}
+    for u in docs:
+        if u not in texts:
+            continue
+        chunks = get_chunks(u, texts[u]["label"], texts[u]["content"])
+        if not chunks:
+            continue
+        pr, hits, iters = rank_chunks_in_doc(chunks, terms, phrase_lc)
+        relevant = [c for c in chunks if hits[c["index"]] > 0]
+        if relevant:
+            keep = sorted(relevant, key=lambda c: -pr[c["index"]])[:CHUNKS_PER_DOC]
+        else:                                   # the document never touches the query
+            keep = [chunks[0]] if KEEP_SEED_FALLBACK and docs[u]["is_seed"] else []
+        best = max((pr[c["index"]] for c in keep), default=0.0) or 1.0
+        for c in keep:
+            cand = dict(c)
+            cand.update(id=f"{u}#{c['index']}", hop=docs[u]["hop"], is_seed=docs[u]["is_seed"],
+                        local_pr=pr[c["index"]] / best, query_hits=hits[c["index"]])
+            candidates.append(cand)
+        per_doc_log[u] = (len(chunks), len(keep), iters)
+    return candidates, per_doc_log, (terms, phrase_lc)
+
+# ------------------------------------------------------------------------------
+# A5. Standard PageRank over ALL kept chunks + the KG sub-graph
+# ------------------------------------------------------------------------------
+def _mentions(candidates, subgraph_nodes):
+    """Which sub-graph nodes each chunk names (inline <links> or label text)."""
+    pats = {}
+    for n in subgraph_nodes:
+        lbl = _LABEL17.get(n, "")
+        if len(lbl) >= 4:
+            pats[n] = re.compile(r"(?<![a-z0-9])" + re.escape(lbl.lower()) + r"(?![a-z0-9])")
+    for c in candidates:
+        low, found = c["text"].lower(), set()
+        for m in _INLINE_RE.finditer(c["text"]):
+            found.update(_L2N17.get(m.group(1).strip().lower(), []))
+        found.update(n for n, p in pats.items() if p.search(low))
+        found.discard(c["doc_uri"])
+        c["mentions"] = found
+
+def rank_chunks_global(candidates, seeds, doc_links, subgraph_nodes, query):
+    """One graph for all candidate chunks (links unweighted):
+         QUERY <-> query word / phrase        QUERY <-> seed node
+         query word / phrase <-> chunk        chunk <-> its document node
+         chunk  -> KG node it names           chunk <-> next chunk (same doc)
+         KG node -> KG node                   (Cell 16 hyperlink edge, its direction)
+    Final chunk score = its standard PageRank (scaled so the best = 1.0)."""
+    terms, phrase_lc = query
+    _mentions(candidates, subgraph_nodes)
+    graph = defaultdict(set)
+    _query_hub(graph, terms, phrase_lc)
+    for n, _l, _s, _p in seeds:
+        _link(graph, "QUERY", f"n:{n}")
+    by_doc = defaultdict(list)
+    for c in candidates:
+        cn = f"c:{c['id']}"
+        graph[cn]
+        _link_query(graph, cn, c, terms, phrase_lc)
+        _link(graph, cn, f"n:{c['doc_uri']}")
+        for n in c["mentions"]:
+            _link(graph, cn, f"n:{n}", both=False)
+        by_doc[c["doc_uri"]].append(c)
+    for cs in by_doc.values():
+        idx = {c["index"]: c for c in cs}
+        for i, c in idx.items():
+            if i + 1 in idx:
+                _link(graph, f"c:{c['id']}", f"c:{idx[i + 1]['id']}")
+    for (A, B), _st in doc_links.items():
+        if A in subgraph_nodes and B in subgraph_nodes:
+            _link(graph, f"n:{A}", f"n:{B}", both=False)
+
+    pr, iters = pagerank(graph)
+    top = max((pr.get(f"c:{c['id']}", 0.0) for c in candidates), default=0.0) or 1.0
+    for c in candidates:
+        c["pagerank"] = pr.get(f"c:{c['id']}", 0.0)
+        c["score"] = c["pagerank"] / top
+        c["links"] = len(graph[f"c:{c['id']}"])
+    return sorted(candidates, key=lambda c: -c["score"]), graph, iters
+
+# ------------------------------------------------------------------------------
+# Relationships for the context (used in 17B)
+# ------------------------------------------------------------------------------
+def rank_relationships(edges, seeds):
+    """Unique (src, predicate, tgt), weak ones removed, strongest + closest first."""
+    min_st = globals().get("MIN_EDGE_STRENGTH", 1)
+    best = {}
+    for e in edges:
+        st = _int(e.get("strength", 0))
+        if st < min_st:
+            continue
+        key = (str(e["source"]), e.get("predicate", ""), str(e["target"]))
+        sc = (st / 10.0) * HOP_PRIOR.get(min(int(e.get("hop", 1)), 2), 0.45) \
+             * (e.get("seed_score", 50) / 100.0)
+        if key not in best or sc > best[key]["rel_score"]:
+            best[key] = dict(e, rel_score=sc)
+    return sorted(best.values(), key=lambda e: -e["rel_score"])
+
+# ------------------------------------------------------------------------------
+# Main entry: question -> ranked chunks
+# ------------------------------------------------------------------------------
+def retrieve_chunks(question, verbose=True):
+    phrases, seeds, fallback = get_seeds(question, verbose)
+    res = {"question": question, "phrases": phrases, "seeds": seeds, "fallback_used": fallback,
+           "edges": [], "docs": {}, "texts": {}, "candidates": [], "ranked_chunks": [],
+           "relationships": []}
+    if not seeds:
+        if verbose:
+            print("  no seeds - nothing to retrieve")
+        return res
+
+    edges, visited = traverse(seeds)                                  # Cell 16
+    docs, doc_links = select_documents(seeds, edges, visited)         # A1
+    texts = fetch_doc_texts(list(docs))                               # A2
+    inline = add_inline_link_docs(docs, texts)                        # A1 (inline links)
+    docs = {u: d for u, d in docs.items() if u in texts}
+    candidates, per_doc, query = pick_chunks_per_doc(question, phrases, docs, texts)  # A3+A4
+    subgraph_nodes = {str(k) for k in visited} | set(docs) | {s[0] for s in seeds}
+    ranked, adj, iters = rank_chunks_global(candidates, seeds, doc_links,
+                                            subgraph_nodes, query)            # A5
+
+    res.update(edges=edges, docs=docs, texts=texts, candidates=candidates,
+               ranked_chunks=ranked, relationships=rank_relationships(edges, seeds),
+               chunk_graph=adj, pr_iterations=iters)
+    if verbose:
+        print(f"\nQ : {question}")
+        print(f"  entities  : {[p for p, _ in phrases]}")
+        print(f"  seeds     : {[(l, round(s, 1)) for _, l, s, _ in seeds]}"
+              + ("  (FALLBACK)" if fallback else ""))
+        print(f"  query nodes: {sorted(query[0])} + phrases {query[1]}")
+        print(f"  edges     : {len(edges)}   documents: {len(docs)}"
+              + (f"  (+{len(inline)} via inline links)" if inline else ""))
+        print("  A4 standard PageRank per document (chunks -> kept, iterations):")
+        for u, d in sorted(docs.items(), key=lambda kv: (kv[1]["hop"], -kv[1]["evidence"])):
+            tot, kept, it = per_doc.get(u, (0, 0, 0))
+            tag = "seed" if d["is_seed"] else ("link" if d.get("via_inline") else f"hop{d['hop']}")
+            print(f"    [{tag:5}] {texts[u]['label'][:62]:62} {tot:3} -> {kept}   ({it} it)")
+        n_chunks = sum(1 for k in adj if k.startswith("c:"))
+        print(f"  A5 standard PageRank: {len(adj)} nodes ({n_chunks} chunks), "
+              f"converged in {iters} iterations")
+        print("  top chunks (score = PageRank / best;  local = PageRank inside its doc):")
+        for c in ranked[:10]:
+            print(f"    {c['score']:.3f}  PR={c['pagerank']:.4f} local={c['local_pr']:.2f} hop={c['hop']} "
+                  f"links={c['links']:2}  {c['doc_label'][:45]} #{c['index']}")
+    return res
+
+print("Defined: retrieve_chunks, get_seeds, select_documents, fetch_doc_texts,")
+print("         chunk_text, pick_chunks_per_doc, rank_chunks_in_doc,")
+print("         rank_chunks_global, pagerank,")
+print("         rank_relationships")
+
+
+
+I need standrad way ok for the ranking 
+
+again 
+
+Cell 17A ─ RETRIEVE & RANK CHUNKS
+
+ │   A1. Pick the documents in the subgraph (seed docs + hop-1/hop-2 docs + hyperlinked docs)
+
+ │   A2. Fetch their content (one SPARQL call)
+
+ │   A3. Chunk from each document
+
+ │   A4. For EACH document: score its chunks against the query, keep the best 3–4 
+
+ │     A5. PageRank on that chunk graph (iterative)
+
+see one documet 
+
+take 3 to 4 chunks ok 
+
+relveant chunks based on the query
+
+use the page rank give the rank for the chunks
+
+use the itervative way
+
+for every document based on the query again and again
