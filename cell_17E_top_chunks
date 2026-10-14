@@ -1,0 +1,66 @@
+# ==============================================================================
+# CELL 17E - TOP-10 CHUNKS WITH MMR (based only on Cell 17A)
+#   relevance  = 17A PageRank score (best chunk = 1.0)
+#   redundancy = word overlap (Jaccard) with chunks already chosen
+#   MMR value  = MMR_LAMBDA * relevance - (1 - MMR_LAMBDA) * redundancy
+#   Output: response_kg_mmr = {"predictions": [{"data": [{"content","title","reference"}]}]}
+# Needs: retrieve_chunks (Cell 17A), g (rdflib graph)
+# ==============================================================================
+import re, json
+from rdflib import URIRef
+
+MMR_TOP_K       = 10     # chunks to return
+MMR_LAMBDA      = 0.7    # 1.0 = only PageRank score, 0.0 = only diversity
+MMR_MAX_PER_DOC = 3      # max chunks from one document
+MMR_MIN_SCORE   = 0.15   # chunks below this 17A score are not used
+MMR_DUP         = 0.6    # skip a chunk sharing >= 60% of its words with a chosen one
+_SRC_REF = URIRef("http://knwbt.local/kg/schema/sourceReference")   # ex:sourceReference (Cell 11)
+
+def _mmr_words(t):
+    return set(re.findall(r"[a-z0-9]+", t.lower()))
+
+def _mmr_reference(doc_uri):
+    try:
+        ref = g.value(URIRef(str(doc_uri)), _SRC_REF)
+    except Exception:
+        ref = None
+    return re.sub(r"^xwiki:", "", str(ref)) if ref else str(doc_uri)
+
+def mmr_select(ranked, k=MMR_TOP_K, lam=MMR_LAMBDA):
+    pool  = [c for c in ranked if c["score"] >= MMR_MIN_SCORE]
+    words = {id(c): _mmr_words(c["text"]) for c in pool}
+    chosen, per_doc = [], {}
+    while pool and len(chosen) < k:
+        best, best_val = None, float("-inf")
+        for c in pool:
+            if per_doc.get(c["doc_uri"], 0) >= MMR_MAX_PER_DOC:
+                continue
+            w = words[id(c)]
+            sim = max((len(w & words[id(o)]) / (len(w | words[id(o)]) or 1) for o in chosen), default=0.0)
+            if sim >= MMR_DUP:
+                continue
+            val = lam * c["score"] - (1 - lam) * sim
+            if val > best_val:
+                best, best_val = c, val
+        if best is None:
+            break
+        best["mmr"] = round(best_val, 4)
+        chosen.append(best); pool.remove(best)
+        per_doc[best["doc_uri"]] = per_doc.get(best["doc_uri"], 0) + 1
+    return chosen
+
+def get_response_kg_mmr(question, k=MMR_TOP_K, verbose=True):
+    ranked = retrieve_chunks(question, verbose=False)["ranked_chunks"]     # Cell 17A
+    chosen = mmr_select(ranked, k)
+    if verbose:
+        print(f"Q: {question}\n17A ranked chunks: {len(ranked)} -> MMR chose {len(chosen)}\n")
+        for i, c in enumerate(chosen, 1):
+            print(f"  {i:2}. PR rank {ranked.index(c) + 1:2}  score={c['score']:.3f}  mmr={c['mmr']:.3f}  {c['doc_label'][:55]}")
+    return {"predictions": [{"data": [{"content": c["text"].strip(),
+                                       "title": c["doc_label"],
+                                       "reference": _mmr_reference(c["doc_uri"])} for c in chosen]}]}
+
+# ---------------------------------------------------------------- run
+QUESTION = "What actions can a Chief Development Engineer perform when managing experiments?"
+response_kg_mmr = get_response_kg_mmr(QUESTION)
+print("\n" + json.dumps(response_kg_mmr, indent=2, ensure_ascii=False))
