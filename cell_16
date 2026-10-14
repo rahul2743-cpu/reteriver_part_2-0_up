@@ -1,0 +1,407 @@
+# ==============================================================================
+# CELL 16 - LINKING + TRAVERSAL (SPARQL, no LLM)            [fixed version]
+# ==============================================================================
+# Traversal works like following Wikipedia links:
+#   Hop 0 : seed documents (+ parent documents of entity-only seeds)
+#   Hop 1 : nodes the hop-0 documents link to
+#   Hop 2 : nodes the hop-1 DOCUMENTS link to
+# Stops at hop 2. Follows OUTGOING edges only (source -> target) unless
+# HOP_DIRECTIONS says "both" for a hop.
+#
+# What changed vs the previous version:
+#   1. Edge query used "?predicate ?pred" (a wildcard), so every statement came
+#      back ~9 times with junk predicates (rdf:Statement, the description text,
+#      the strength number...). Now it is "rdf:predicate ?pred".
+#   2. DOC_CONTENT_TMPL placeholder is "$DOCS$", matching fetch_documents()
+#      in Cell 17 (it was "%DOCS%", so no document text was ever fetched).
+#   3. link_entities used LABEL (a regex string from Cell 5) -> NODE_LABEL.
+#   4. Entity-only seeds are promoted to the few strongest documents that link
+#      to them. Before, an entity-only query produced zero edges.
+#   5. The hop-2 frontier keeps only document nodes, the same rule as hop 0.
+#   6. "both" direction uses UNION instead of a full-scan FILTER.
+#   7. Breadth guards now actually fire (query LIMIT = cap + 1), and Pass 3
+#      runs only when THIS phrase found nothing in Pass 1 / Pass 2.
+#   8. Edge de-duplication uses the predicate URI, not its display label.
+#   9. Node ids are converted to plain str (rdflib URIRef != str), so
+#      membership tests like `x in CONTENT_NODES` never fail silently.
+# ==============================================================================
+import re
+from collections import defaultdict
+
+print("=" * 80)
+print("CELL 16 - LINKING + TRAVERSAL")
+print("=" * 80)
+
+# --- names that must already exist (config cell / Cell 15) -------------------
+_REQUIRED = ["g", "PREFIXES", "CONTENT_NODES", "LABEL_TO_NODES", "ALL_LABELS",
+             "NODE_LABEL", "fuzzy_match", "MAX_SEEDS_PER_PHRASE",
+             "MAX_TOTAL_SEEDS", "PREDICATE_MARKER", "MATCH_CUTOFF",
+             "MAX_FRONTIER", "MAX_EDGES"]
+_missing = [n for n in _REQUIRED if n not in globals()]
+if _missing:
+    raise NameError(f"Run the earlier cells first - not defined: {_missing}")
+
+# --- normalise node ids to plain str ------------------------------------------
+# rdflib: URIRef("x") == "x" is False and the two hash differently, so a set of
+# URIRefs never matches the str(row.x) values this cell compares against.
+# Converting once here makes every membership test below (and in Cell 17) safe,
+# whether Cell 15 built these with URIRefs or with plain strings.
+CONTENT_NODES  = {str(n) for n in CONTENT_NODES}                              # NEW
+NODE_LABEL     = {str(k): str(v) for k, v in NODE_LABEL.items()}             # NEW
+LABEL_TO_NODES = {str(k): [str(n) for n in v] for k, v in LABEL_TO_NODES.items()}  # NEW
+
+# --- traversal settings ------------------------------------------------------
+TRAVERSE_HOPS          = 2                     # hard stop at hop 2
+HOP_DIRECTIONS         = {1: "out", 2: "out"}  # "out" = follow links, "both" = also incoming
+HOP1_EDGE_SHARE        = 0.6                   # hop 1 may use 60% of MAX_EDGES
+PROMOTE_ENTITY_SEEDS   = True                  # entity seed -> documents that link to it
+PARENT_DOCS_PER_ENTITY = 2                     # strongest parent documents kept per entity
+
+# ------------------------------------------------------------------------------
+# SPARQL templates
+# ------------------------------------------------------------------------------
+_EDGE_SELECT = """
+SELECT ?src ?srclabel ?pred ?predLabel ?tgt ?tgtLabel
+       ?description ?strength ?linkType
+"""
+
+# One reified rdf:Statement = one edge; the statement carries the metadata.
+_EDGE_BODY = """
+  ?stmt a rdf:Statement ;
+        rdf:subject    ?src ;
+        rdf:predicate  ?pred ;
+        rdf:object     ?tgt ;
+        ex:description ?description ;
+        ex:strength    ?strength ;
+        ex:linkType    ?linkType .
+"""
+
+_EDGE_LABELS = """
+  OPTIONAL { ?src  rdfs:label ?srclabel }
+  OPTIONAL { ?tgt  rdfs:label ?tgtLabel }
+  OPTIONAL { ?pred rdfs:label ?predLabel }
+"""
+
+# OUTGOING only: frontier nodes are the SUBJECT of the statement.
+NEIGHBOUR_OUT_TMPL = (PREFIXES + _EDGE_SELECT + "WHERE {\n"
+                      "  VALUES ?src { %SEEDS% }\n"
+                      + _EDGE_BODY + _EDGE_LABELS + "}\n")
+
+# BOTH directions: frontier node is the subject OR the object.
+NEIGHBOUR_BOTH_TMPL = (PREFIXES + _EDGE_SELECT + "WHERE {\n"
+                       "  { VALUES ?src { %SEEDS% } }\n"
+                       "  UNION\n"
+                       "  { VALUES ?tgt { %SEEDS% } }\n"
+                       + _EDGE_BODY + _EDGE_LABELS + "}\n")
+
+# Entity promotion: documents (nodes with content) that point TO the entity.
+PARENT_DOCS_TMPL = (PREFIXES + _EDGE_SELECT + "WHERE {\n"
+                    "  VALUES ?tgt { %SEEDS% }\n"
+                    + _EDGE_BODY +
+                    "  FILTER EXISTS { ?src ex:documentContent ?anyContent }\n"
+                    + _EDGE_LABELS + "}\n")
+
+# Placeholder is $DOCS$ because fetch_documents() in Cell 17 replaces "$DOCS$".
+DOC_CONTENT_TMPL = PREFIXES + """
+SELECT ?doc ?label ?content
+WHERE {
+  VALUES ?doc { $DOCS$ }
+  ?doc ex:documentContent ?content .
+  OPTIONAL { ?doc rdfs:label ?label }
+}
+"""
+
+# LIMIT is cap + 1 so the breadth guard can tell "too many matches" apart.
+SUBSTRING_TMPL = PREFIXES + """
+SELECT DISTINCT ?node ?label
+WHERE {
+  ?node rdfs:label ?label .
+  FILTER(CONTAINS(LCASE(STR(?label)), %PHRASE%))
+  FILTER(!STRSTARTS(STR(?node), %PREDMARK%))
+}
+LIMIT %LIMIT%
+"""
+
+CONTENT_SEARCH_TMPL = PREFIXES + """
+SELECT DISTINCT ?doc ?label
+WHERE {
+  ?doc ex:documentContent ?c .
+  OPTIONAL { ?doc rdfs:label ?label }
+  FILTER(CONTAINS(LCASE(STR(?c)), %PHRASE%))
+}
+LIMIT %LIMIT%
+"""
+
+# ------------------------------------------------------------------------------
+# Token filters
+# ------------------------------------------------------------------------------
+_STOP = {"the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "is",
+         "are", "what", "which", "how", "does", "do", "with", "by", "from"}
+
+# Generic tokens that appear in MANY labels but carry no discriminative power.
+# Blocked from Pass 3 so words like 'source', 'document' never become seeds.
+_GENERIC_TOKENS = {
+    "source", "located", "location", "document", "documents",
+    "report", "reports", "record", "records", "section",
+    "method", "process", "system", "approach", "result",
+    "figure", "number", "output", "status", "update",
+    "create", "define", "provide", "contain", "include",
+    "engineer", "engineers", "engineering",
+    "development", "developed",
+    "management", "manager", "managers", "technical",
+}
+
+# ------------------------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------------------------
+def _tokens(s):
+    return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if t not in _STOP and len(t) > 2}
+
+def _values_block(uris):
+    """URIs -> '<u1> <u2> ...'. Skips anything that would break the query."""
+    return " ".join(f"<{u}>" for u in uris
+                    if u and "<" not in u and ">" not in u and not re.search(r"\s", u))
+
+def _sparql_literal(s):
+    s = (s.replace("\\", "\\\\").replace('"', '\\"')
+          .replace("\n", "\\n").replace("\r", "\\r"))
+    return '"' + s + '"'
+
+def _to_int(x, default=0):
+    try:
+        return int(float(str(x)))
+    except (TypeError, ValueError):
+        return default
+
+def _run(tmpl, uris, what):
+    """Fill %SEEDS% with a VALUES block and run. None = nothing to run / failed."""
+    block = _values_block(uris)
+    if not block:
+        return None
+    try:
+        return list(g.query(tmpl.replace("%SEEDS%", block)))
+    except Exception as e:
+        print(f"  {what} query failed: {e}")
+        return None
+
+def _row_to_edge(row, hop, seed_score):
+    src, tgt, pred_uri = str(row.src), str(row.tgt), str(row.pred)
+    pred = str(row.predLabel) if row.predLabel else re.split(r"[/#]", pred_uri)[-1]
+    return {
+        "source":       src,
+        "source_label": str(row.srclabel) if row.srclabel else NODE_LABEL.get(src, src),
+        "predicate":    pred,
+        "pred_uri":     pred_uri,
+        "target":       tgt,
+        "target_label": str(row.tgtLabel) if row.tgtLabel else NODE_LABEL.get(tgt, tgt),
+        "description":  str(row.description),
+        "strength":     _to_int(row.strength),
+        "link_type":    str(row.linkType),
+        "hop":          hop,
+        "seed_score":   seed_score,
+    }
+
+def _substring_nodes(text):
+    """Label-substring lookup. Returns list of node URIs, or None on failure."""
+    q = (SUBSTRING_TMPL
+         .replace("%PHRASE%", _sparql_literal(text.lower()))
+         .replace("%PREDMARK%", PREDICATE_MARKER)
+         .replace("%LIMIT%", str(MAX_SEEDS_PER_PHRASE + 1)))
+    try:
+        return [str(r.node) for r in g.query(q)]
+    except Exception as e:
+        print(f"  substring query failed for {text!r}: {e}")
+        return None
+
+# ------------------------------------------------------------------------------
+# 1) Entity linking
+# ------------------------------------------------------------------------------
+def link_entities(phrases):
+    """Phrases -> [(node, label, score, phrase)]. THREE passes:
+       Pass 1 : SPARQL label substring (full phrase)  - precision, score 95
+       Pass 2 : fuzzy match on all labels             - recall, cutoff MATCH_CUTOFF
+       Pass 3 : token-level substring fallback        - score 80, only when
+                Pass 1 + 2 found NOTHING for this phrase.
+       A phrase (or token) matching more than MAX_SEEDS_PER_PHRASE nodes is
+       treated as corpus-generic and skipped.
+    """
+    best = {}  # node -> (score, phrase)
+
+    def _keep(node, score, phrase):
+        if node not in best or score > best[node][0]:
+            best[node] = (score, phrase)
+
+    for phrase, _ls in phrases:
+        phrase_hit = False
+
+        # --- Pass 1: full-phrase substring ------------------------------------
+        nodes = _substring_nodes(phrase)
+        if nodes and len(nodes) <= MAX_SEEDS_PER_PHRASE:
+            for node in nodes:
+                _keep(node, 95.0, phrase)
+                phrase_hit = True
+
+        # --- Pass 2: fuzzy match ----------------------------------------------
+        for label_lc, score in fuzzy_match(phrase.lower(), ALL_LABELS,
+                                           MAX_SEEDS_PER_PHRASE, MATCH_CUTOFF):
+            for node in LABEL_TO_NODES.get(label_lc, []):
+                _keep(node, float(score), phrase)
+                phrase_hit = True
+
+        # --- Pass 3: token fallback, only if this phrase found nothing --------
+        if phrase_hit:
+            continue
+        phrase_tokens = [t for t in re.findall(r"[a-zA-Z0-9]+", phrase)
+                         if len(t) >= 6
+                         and t.lower() not in _STOP
+                         and t.lower() not in _GENERIC_TOKENS]
+        for tok in phrase_tokens:
+            nodes = _substring_nodes(tok)
+            if not nodes or len(nodes) > MAX_SEEDS_PER_PHRASE:
+                continue  # failed, empty, or corpus-generic token
+            for node in nodes:
+                _keep(node, 80.0, phrase)
+
+    ranked = sorted(best.items(), key=lambda x: -x[1][0])[:MAX_TOTAL_SEEDS]
+    return [(n, NODE_LABEL.get(n, n), s, p) for n, (s, p) in ranked]
+
+
+def lexical_fallback(question, limit=5):
+    """No LLM, no embeddings. Used when extraction returns nothing or
+    nothing links."""
+    q_tokens = _tokens(question)
+    if not q_tokens:
+        return []
+    scored = []
+    for label_lc, nodes in LABEL_TO_NODES.items():
+        overlap = q_tokens & _tokens(label_lc)
+        if overlap:
+            score = 100.0 * len(overlap) / max(len(_tokens(label_lc)), 1)
+            for n in nodes:
+                scored.append((n, NODE_LABEL.get(n, n), min(score, 99.0), "lexical"))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return scored[:limit]
+
+# ------------------------------------------------------------------------------
+# 2) Traversal
+# ------------------------------------------------------------------------------
+def _promote_entity_seeds(entity_seeds, visited, edges, seen):
+    """
+    Entity nodes have no outgoing links, so they cannot start a traversal.
+    For each entity seed, keep the PARENT_DOCS_PER_ENTITY strongest documents
+    that link to it, and use those documents as hop-0 frontier.
+    Capped and strength-ordered, so a widely-mentioned entity cannot pull in
+    every document that merely mentions it.
+    """
+    rows = _run(PARENT_DOCS_TMPL, list(entity_seeds), "entity promotion")
+    if not rows:
+        return []
+    rows.sort(key=lambda r: _to_int(r.strength), reverse=True)
+
+    docs_per_entity = defaultdict(set)
+    promoted = []
+    for row in rows:
+        doc, ent = str(row.src), str(row.tgt)
+        if doc not in CONTENT_NODES:
+            continue
+        if doc not in docs_per_entity[ent] and len(docs_per_entity[ent]) >= PARENT_DOCS_PER_ENTITY:
+            continue
+        key = (doc, str(row.pred), ent)
+        if key in seen:
+            continue
+        seen.add(key)
+        docs_per_entity[ent].add(doc)
+
+        score = entity_seeds.get(ent, 0.0)   # NEW: was entity_seeds[ent]
+        edges.append(_row_to_edge(row, hop=1, seed_score=score))  # doc -> entity link
+        if doc not in visited:
+            visited[doc] = (0, score)
+            promoted.append(doc)
+    return promoted
+
+
+def traverse(seeds):
+    """
+    Wikipedia-style expansion, one SPARQL query per hop, up to TRAVERSE_HOPS.
+        hop 0 : seed documents + parent documents of entity seeds
+        hop 1 : nodes the hop-0 documents link to
+        hop 2 : nodes the hop-1 documents link to
+    Only document nodes (CONTENT_NODES) are expanded. Each node is expanded
+    once, so there are no loops. Hop 1 cannot use the whole edge budget.
+    Returns (edges, visited) where visited = {node: (hop, seed_score)}.
+    """
+    seeds = [(str(n), l, s, p) for n, l, s, p in seeds]   # NEW: URIRef -> str
+    edges, seen = [], set()
+    visited = {n: (0, s) for n, _l, s, _p in seeds}
+
+    frontier     = [n for n, _l, _s, _p in seeds if n in CONTENT_NODES]
+    entity_seeds = {n: s for n, _l, s, _p in seeds if n not in CONTENT_NODES}
+
+    if PROMOTE_ENTITY_SEEDS and entity_seeds:
+        promoted = _promote_entity_seeds(entity_seeds, visited, edges, seen)
+        frontier.extend(promoted)
+        print(f"  entity seeds: {len(entity_seeds)} -> parent documents added: {len(promoted)}")
+
+    for hop in range(1, TRAVERSE_HOPS + 1):
+        if not frontier or len(edges) >= MAX_EDGES:
+            break
+
+        direction = HOP_DIRECTIONS.get(hop, "out")
+        tmpl = NEIGHBOUR_BOTH_TMPL if direction == "both" else NEIGHBOUR_OUT_TMPL
+        rows = _run(tmpl, frontier[:MAX_FRONTIER], f"hop {hop}")
+        if rows is None:
+            break
+
+        # strongest links first, so the cap keeps the best ones
+        rows.sort(key=lambda r: _to_int(r.strength), reverse=True)
+
+        # hop 1 keeps part of the budget back for hop 2
+        cap = int(MAX_EDGES * HOP1_EDGE_SHARE) if hop < TRAVERSE_HOPS else MAX_EDGES
+
+        next_frontier = []
+        for row in rows:
+            if len(edges) >= cap:
+                break
+            src, tgt = str(row.src), str(row.tgt)
+            key = (src, str(row.pred), tgt)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            seed_score = max(visited.get(src, (0, 0))[1], visited.get(tgt, (0, 0))[1])
+            edges.append(_row_to_edge(row, hop, seed_score))
+
+            for other in (src, tgt):
+                if other not in visited:
+                    visited[other] = (hop, seed_score)
+                    if other in CONTENT_NODES:     # only documents have outgoing links
+                        next_frontier.append(other)
+        frontier = next_frontier
+
+    return edges, visited
+
+# ------------------------------------------------------------------------------
+# 3) Content fallback
+# ------------------------------------------------------------------------------
+def content_search(phrase, limit=3):
+    """
+    Last-resort fallback: scan ex:documentContent for a phrase that entity
+    linking could not resolve. Returns [(node_uri, label, 70.0, phrase)],
+    the same shape as link_entities. Score 70 is below the other passes so a
+    proper entity link always outranks a content hit.
+    Note: this scans all document text, so keep it a fallback.
+    """
+    q = (CONTENT_SEARCH_TMPL
+         .replace("%PHRASE%", _sparql_literal(phrase.lower()))
+         .replace("%LIMIT%", str(limit)))
+    try:
+        return [(str(r.doc),
+                 str(r.label) if r.label else NODE_LABEL.get(str(r.doc), str(r.doc)),
+                 70.0, phrase)
+                for r in g.query(q)]
+    except Exception as e:
+        print(f"  content_search failed for {phrase!r}: {e}")
+        return []
+
+print("Defined: link_entities, lexical_fallback, traverse, content_search")
