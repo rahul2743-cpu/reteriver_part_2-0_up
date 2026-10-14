@@ -1,64 +1,44 @@
 # ==============================================================================
-# CELL 17B-EVAL : run many questions and check every answer in one table
-# (run after Cell 17A and 17B)
-#   For each question give words the correct answer MUST contain ("expect").
-#   Use expect=[] for a question the wiki cannot answer (answer must say "not contain").
+# CELL 17B-INPUT : show EXACTLY what is sent to the LLM for one question
+# (run after Cell 17A and 17B; change QUESTION and run again)
 # ==============================================================================
-import re, time
-import pandas as pd
+QUESTION = "What actions can a Chief Development Engineer perform when managing experiments?"
 
-TESTS = [
-    {"q": "What actions can a Chief Development Engineer perform when managing experiments?",
-     "expect": ["approve", "experiment"]},
-    {"q": "What is HITCH used for?",                      "expect": ["sign"]},
-    {"q": "How do I book a rocket to the moon?",          "expect": []},     # not in wiki
-    # add your own questions here ...
-]
-NOT_FOUND = ["do not contain", "not found in the provided documents"]
+res = kg_answer(QUESTION, verbose=False)
+ctx = res["context"]
+user_msg = f"{ctx}\n\n---QUESTION---\n{QUESTION}"
 
-def check_one(t):
-    t0 = time.time()
-    res = kg_answer(t["q"], verbose=False)
-    ans, ctx = res["answer"], res["context"]
-    body = ans.split("Sources:")[0].replace("Answer:", "")
-    sent = [s for s in re.split(r"(?<=[.!?])\s+", body) if len(s.strip()) > 20]
-    uncited = [s for s in sent if not re.search(r"\[[CR]\d+\]", s)
-               and not any(p in s.lower() for p in NOT_FOUND)]
-    says_nf = any(p in ans.lower() for p in NOT_FOUND)
-    if t["expect"]:
-        missing  = [w for w in t["expect"] if w.lower() not in ans.lower()]
-        in_ctx   = all(w.lower() in ctx.lower() for w in t["expect"])
-        correct  = not missing
-    else:                                   # wiki has no answer -> must refuse
-        missing, in_ctx, correct = [], True, says_nf
-    ok = correct and not res["invalid_ids"] and not uncited and len(ctx) <= MAX_CONTEXT_CHARS + 100
-    return {"question": t["q"][:60], "K": res["k"], "chunks": len(res["top_chunks"]),
-            "ctx_chars": len(ctx), "cited": len(res["cited"]), "invalid": len(res["invalid_ids"]),
-            "uncited": len(uncited), "found_in_ctx": in_ctx, "missing_words": ",".join(missing),
-            "correct": correct, "PASS": ok, "sec": round(time.time() - t0, 1),
-            "_res": res}
+def line(t):
+    print("\n" + "=" * 90 + f"\n{t}\n" + "=" * 90)
 
-rows = [check_one(t) for t in TESTS]
-df = pd.DataFrame([{k: v for k, v in r.items() if k != "_res"} for r in rows])
-pd.set_option("display.width", 200); pd.set_option("display.max_columns", 20)
-print(df.to_string(index=False))
+# ---- 1. what was chosen -------------------------------------------------------
+line(f"1. CHUNKS CHOSEN: {len(res['top_chunks'])} (K={res['k']})")
+for i, c in enumerate(res["top_chunks"], 1):
+    print(f"  {i}. score={c['score']:.3f}  {c['doc_label'][:60]}  (chunk #{c['index']}, {len(c['text'])} chars)")
 
-n = len(df)
-print(f"\nPASSED            : {df.PASS.sum()}/{n}")
-print(f"correct answers   : {df.correct.sum()}/{n}")
-print(f"invented IDs      : {df.invalid.sum()}   uncited sentences: {df.uncited.sum()}")
-print(f"avg context       : {df.ctx_chars.mean():.0f} chars (~{df.ctx_chars.mean()/4:.0f} tokens)")
+# ---- 2. message 1 = SYSTEM (rules) -------------------------------------------
+line(f"2. MESSAGE 1 - SYSTEM (rules): {len(ANSWER_PROMPT)} chars")
+print(ANSWER_PROMPT)
 
-# ---- why did a question fail? -------------------------------------------------
-for r in rows:
-    if r["PASS"]:
-        continue
-    res = r["_res"]
-    print("\n" + "-" * 90 + f"\nFAILED: {res['question']}")
-    if not r["found_in_ctx"]:
-        print("  -> expected words are NOT in the context: retrieval problem (Cell 16/17A)")
-    elif not r["correct"]:
-        print("  -> words are in the context but not in the answer: LLM/prompt problem")
-    if r["invalid"]:  print("  -> invented IDs:", res["invalid_ids"])
-    if r["uncited"]:  print("  -> sentences without citation:", r["uncited"])
-    print("  answer:", res["answer"][:400].replace("\n", " "))
+# ---- 3. message 2 = USER (context + question) --------------------------------
+line(f"3. MESSAGE 2 - USER (context + question): {len(user_msg)} chars")
+print(user_msg)
+
+# ---- 4. size summary -----------------------------------------------------------
+total = len(ANSWER_PROMPT) + len(user_msg)
+line("4. SIZE SENT TO THE LLM")
+print(f"  text blocks [C#]   : {ctx.count(chr(10) + '[C')}")
+print(f"  relationships [R#] : {ctx.count(chr(10) + '[R')}")
+print(f"  context            : {len(ctx)} chars  (limit {MAX_CONTEXT_CHARS})")
+print(f"  total (system+user): {total} chars  (~{total // 4} tokens)")
+if "(none)" in ctx.split("### RELATIONSHIPS")[0]:
+    print("  WARNING: no document text was sent -> retrieval found nothing (Cell 16/17A)")
+
+# ---- 5. what came back ---------------------------------------------------------
+line("5. LLM OUTPUT")
+print("raw (with IDs) :\n" + res.get("raw_answer", res["answer"]))
+print("\nclean (user)   :\n" + res["answer"])
+print("\ncited IDs      :", res["cited"], "   invented IDs:", res["invalid_ids"] or "none")
+print("sources        :")
+for s in res["sources"]:
+    print("  -", s["title"] if isinstance(s, dict) else s)
