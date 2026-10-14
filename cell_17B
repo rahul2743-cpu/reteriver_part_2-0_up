@@ -1,0 +1,168 @@
+# ==============================================================================
+# CELL 17B - SELECT & ANSWER   (small, focused context: ~6,000 chars / ~1,500 tokens)
+#   B1. top-K chunks (max 3 per doc, weak chunks + near-duplicates dropped)
+#   B2. build_context = top relationships + top-K chunks (neighbours merged)
+#   B3. anti-hallucination prompt
+#   B4. LLM answer + sources (cited IDs checked against the context)
+# Main function: kg_answer(question, verbose=True) -> dict
+# Needs: retrieve_chunks (Cell 17A), driver_llm (your LLM, temperature 0)
+# ==============================================================================
+import re
+
+MAX_CONTEXT_CHARS  = 6000       # total text sent to the LLM (~1,500 tokens)
+REL_CHARS          = 1000       # part of the budget kept for relationships
+TOP_K_MIN, TOP_K_MAX = 4, 7     # 6,000 chars holds ~5-7 chunks of 900 chars
+MIN_CHUNK_SCORE    = 0.30       # "strong" chunk (17A score, best = 1.0) -> decides K
+MIN_KEEP_SCORE     = 0.15       # chunks below this are never sent
+MAX_PER_DOC        = 3          # max chunks from one document
+DUP_OVERLAP        = 0.6        # drop a chunk sharing >= 60% of its words with a chosen one
+MAX_RELATIONSHIPS  = 6          # KG facts in the context
+MIN_REL_STRENGTH   = 5          # only clear relationships (strength 5-10)
+
+ANSWER_PROMPT = """--- ROLE ---
+You are an engineering assistant. Answer ONLY from the CONTEXT, which was retrieved
+from an engineering wiki and its knowledge graph. If something is not in the context,
+you do not know it.
+
+--- CONTEXT ---
+[C#] DOCUMENT TEXT: exact wiki text with the page title. Primary evidence.
+[R#] RELATIONSHIPS: Source --[predicate, strength 1-10]--> Target : explanation. Supporting hints.
+
+--- RULES ---
+1. End every sentence with the ID(s) it comes from, e.g. [C2] or [C1][R3].
+   Do not write a sentence you cannot cite.
+2. Do NOT add steps, numbers, names, values, tools or dates that are not in the cited text.
+3. Do not combine different sources into a claim that none of them states.
+4. If sources disagree, report both with their IDs.
+5. If only part is answered, answer that part, then write:
+   "Not found in the provided documents: <missing part>."
+6. If nothing answers the question, reply exactly:
+   "The provided documents do not contain this information."
+   and name the closest related topic in the context with its ID.
+7. If a cited page title contains "Obsolete", say the information may be outdated.
+8. Be concise. No preamble, no outside knowledge.
+
+--- OUTPUT ---
+Answer:
+<answer, every sentence cited>
+
+Sources:
+- <page title> [C#]"""
+
+def _words(t):
+    return set(re.findall(r"[a-z0-9]+", t.lower()))
+
+# ---------------------------------------------------------------- B1
+def choose_k(question, phrases, ranked):
+    """K = number of strong chunks, kept between TOP_K_MIN and TOP_K_MAX; broad questions -> max."""
+    strong = sum(c["score"] >= MIN_CHUNK_SCORE for c in ranked)
+    k = max(TOP_K_MIN, min(TOP_K_MAX, strong))
+    if len(phrases) >= 4 or len(re.findall(r"\band\b|,", question.lower())) >= 2:
+        k = TOP_K_MAX
+    return k
+
+def select_top_chunks(ranked, k):
+    chosen, count = [], {}
+    for c in ranked:                                   # best first (17A)
+        if len(chosen) >= k or c["score"] < MIN_KEEP_SCORE:
+            break
+        if count.get(c["doc_uri"], 0) >= MAX_PER_DOC:
+            continue
+        w = _words(c["text"])
+        if any(len(w & _words(o["text"])) / (len(w) or 1) >= DUP_OVERLAP for o in chosen):
+            continue
+        chosen.append(c)
+        count[c["doc_uri"]] = count.get(c["doc_uri"], 0) + 1
+    return chosen
+
+# ---------------------------------------------------------------- B2
+def _join(prev, nxt):
+    """Join two neighbouring chunks without repeating their overlap."""
+    for n in range(min(len(prev), len(nxt), 400), 15, -1):
+        if prev.endswith(nxt[:n]):
+            return prev + nxt[n:]
+    return prev + "\n" + nxt
+
+def _blocks(chunks):
+    """One block per run of neighbouring chunks of a document, best block first."""
+    by_doc = {}
+    for c in chunks:
+        by_doc.setdefault(c["doc_uri"], []).append(c)
+    blocks = []
+    for cs in by_doc.values():
+        cs.sort(key=lambda c: c["index"])
+        run = [cs[0]]
+        for c in cs[1:] + [None]:
+            if c is not None and c["index"] == run[-1]["index"] + 1:
+                run.append(c)
+                continue
+            text = run[0]["text"].strip()
+            for o in run[1:]:
+                text = _join(text, o["text"].strip())
+            parts = f"{run[0]['index'] + 1}" + (f"-{run[-1]['index'] + 1}" if len(run) > 1 else "")
+            blocks.append({"doc_uri": run[0]["doc_uri"], "doc_label": run[0]["doc_label"],
+                           "parts": parts, "text": text, "score": max(x["score"] for x in run)})
+            run = [c]
+    return sorted(blocks, key=lambda b: -b["score"])
+
+def build_context(chunks, relationships):
+    used, ids, chunk_lines, rel_lines = 0, {}, [], []
+    text_budget = MAX_CONTEXT_CHARS - REL_CHARS
+    for b in _blocks(chunks):                          # best text first, until the budget
+        cid = f"C{len(chunk_lines) + 1}"
+        block = f"[{cid}] ({b['doc_label']} - part {b['parts']})\n{b['text'][:text_budget - 200]}\n"
+        if used + len(block) > text_budget:
+            continue
+        chunk_lines.append(block); ids[cid] = b; used += len(block)
+    docs = {b["doc_uri"] for b in ids.values()}
+    for e in relationships:                            # only strong facts about these docs
+        if len(rel_lines) >= MAX_RELATIONSHIPS:
+            break
+        if e["strength"] < MIN_REL_STRENGTH or not ({str(e["source"]), str(e["target"])} & docs):
+            continue
+        rid = f"R{len(rel_lines) + 1}"
+        line = (f"[{rid}] {e['source_label']} --[{e['predicate']}, {e['strength']}]--> "
+                f"{e['target_label']} : {e['description']}")
+        if used + len(line) > MAX_CONTEXT_CHARS:
+            continue
+        rel_lines.append(line); ids[rid] = e; used += len(line)
+    context = ("### DOCUMENT TEXT\n" + ("\n".join(chunk_lines) or "(none)") +
+               "\n### RELATIONSHIPS\n" + ("\n".join(rel_lines) or "(none)"))
+    return context, ids
+
+# ---------------------------------------------------------------- B3 + B4
+def kg_answer(question, verbose=True):
+    r = retrieve_chunks(question, verbose=False)
+    k = choose_k(question, r["phrases"], r["ranked_chunks"]) if r["ranked_chunks"] else 0
+    top = select_top_chunks(r["ranked_chunks"], k)
+    context, ids = build_context(top, r["relationships"])
+    out = {"question": question, "answer": "The provided documents do not contain this information.",
+           "sources": [], "cited": [], "invalid_ids": [], "k": k, "top_chunks": top,
+           "context": context, "retrieval": r}
+    if top:
+        try:
+            resp = driver_llm.invoke([
+                {"role": "system", "content": ANSWER_PROMPT},
+                {"role": "user", "content": f"{context}\n\n---QUESTION---\n{question}"}])
+            out["answer"] = resp.content.strip()
+        except Exception as e:
+            out["answer"] = f"[generation failed: {e}]"
+        found = set(re.findall(r"\[([CR]\d+)\]", out["answer"]))
+        out["cited"] = sorted(found & set(ids), key=lambda x: (x[0], int(x[1:])))
+        out["invalid_ids"] = sorted(found - set(ids))           # IDs the LLM invented
+        out["sources"] = list(dict.fromkeys(ids[i]["doc_label"] for i in out["cited"] if i[0] == "C"))
+    if verbose:
+        n_c = sum(i[0] == "C" for i in ids)
+        print(f"\nQ : {question}")
+        print(f"  seeds   : {[l for _, l, _, _ in r['seeds']][:5]}")
+        print(f"  chunks  : {len(r['ranked_chunks'])} ranked, K={k} -> {len(top)} chosen "
+              f"-> {n_c} text blocks from {len({c['doc_uri'] for c in top})} docs")
+        print(f"  context : {len(context)} chars (~{len(context) // 4} tokens), "
+              f"{len(ids) - n_c} relationships")
+        print(f"  cited   : {out['cited']}"
+              + (f"   INVALID IDs: {out['invalid_ids']}" if out["invalid_ids"] else ""))
+        print(f"  sources : {out['sources']}\n\nANSWER:\n{out['answer']}")
+    return out
+
+print(f"Defined: kg_answer  (K={TOP_K_MIN}-{TOP_K_MAX}, max {MAX_PER_DOC}/doc, "
+      f"context <= {MAX_CONTEXT_CHARS} chars)")
