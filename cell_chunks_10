@@ -1,0 +1,53 @@
+# ==============================================================================
+# CELL 17C - TOP-10 CHUNKS -> response_kg  (no LLM call)
+#   Takes the PageRank-ranked chunks from Cell 17A, keeps the top 10
+#   (max 3 per document, weak chunks and near-duplicates dropped) and stores them as
+#   response_kg = {"predictions": [{"data": [{"content", "title", "reference"}, ...]}]}
+# Needs: retrieve_chunks (Cell 17A), g (rdflib graph)
+# ==============================================================================
+import re, json
+from rdflib import URIRef
+
+TOP_K          = 10      # number of chunks to return
+MAX_PER_DOC    = 3       # max chunks from one document (17A keeps max 4 per doc)
+MIN_KEEP_SCORE = 0.15    # chunks below this score are not returned
+DUP_OVERLAP    = 0.6     # drop a chunk sharing >= 60% of its words with a chosen one
+_SRC_REF = URIRef("http://knwbt.local/kg/schema/sourceReference")   # ex:sourceReference (Cell 11)
+
+def _wordset(t):
+    return set(re.findall(r"[a-z0-9]+", t.lower()))
+
+def _reference(doc_uri):
+    """XWiki reference of the page (ex:sourceReference); falls back to the node URI."""
+    try:
+        ref = g.value(URIRef(str(doc_uri)), _SRC_REF)
+    except Exception:
+        ref = None
+    return re.sub(r"^xwiki:", "", str(ref)) if ref else str(doc_uri)
+
+def top_k_chunks(question, k=TOP_K):
+    ranked = retrieve_chunks(question, verbose=False)["ranked_chunks"]   # best first
+    chosen, per_doc = [], {}
+    for c in ranked:
+        if len(chosen) >= k or c["score"] < MIN_KEEP_SCORE:
+            break
+        if per_doc.get(c["doc_uri"], 0) >= MAX_PER_DOC:
+            continue
+        w = _wordset(c["text"])
+        if any(len(w & _wordset(o["text"])) / (len(w) or 1) >= DUP_OVERLAP for o in chosen):
+            continue
+        chosen.append(c)
+        per_doc[c["doc_uri"]] = per_doc.get(c["doc_uri"], 0) + 1
+    return [{"content": c["text"].strip(),
+             "title": c["doc_label"],
+             "reference": _reference(c["doc_uri"])} for c in chosen]
+
+def get_response_kg(question, k=TOP_K):
+    return {"predictions": [{"data": top_k_chunks(question, k)}]}
+
+# ---------------------------------------------------------------- run
+QUESTION = "What actions can a Chief Development Engineer perform when managing experiments?"
+response_kg = get_response_kg(QUESTION)
+
+print(f"Q: {QUESTION}\nchunks returned: {len(response_kg['predictions'][0]['data'])}\n")
+print(json.dumps(response_kg, indent=2, ensure_ascii=False))
