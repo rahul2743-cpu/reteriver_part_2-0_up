@@ -1,0 +1,99 @@
+# ==============================================================================
+# CELL 17A-DEBUG : see step by step what retrieve_chunks() did for one question
+# (run after Cell 17A; change QUESTION and run again)
+# ==============================================================================
+from collections import Counter, defaultdict
+
+QUESTION = "What oil system processes from the Whole Gas Turbine guide apply when working with suppliers and specifications?"
+SHOW_TOP = 10          # how many final chunks to print
+PREVIEW  = 220         # characters of chunk text to show
+
+r = retrieve_chunks(QUESTION, verbose=False)
+
+def line(t):
+    print("\n" + "=" * 90 + f"\n{t}\n" + "=" * 90)
+
+# ---------------------------------------------------------------- 1. the query
+line("1. QUERY -> entities (Cell 15) and query words/phrases (used in PageRank)")
+print("question :", QUESTION)
+print("entities :", r["phrases"])
+terms, phrase_lc = query_nodes(QUESTION, r["phrases"])
+print("words    :", sorted(terms))
+print("phrases  :", phrase_lc)
+
+# ---------------------------------------------------------------- 2. seeds
+line("2. SEEDS (Cell 16 link_entities + fallbacks)")
+if not r["seeds"]:
+    print("NO SEEDS -> nothing retrieved. Check Cell 15 entities / Cell 16 linking.")
+for n, l, s, p in r["seeds"]:
+    kind = "document" if n in _DOCS17 else "entity"
+    print(f"  {s:6.1f}  [{kind:8}] {l}   <- phrase '{p}'")
+print("fallback used:", r["fallback_used"])
+
+# ---------------------------------------------------------------- 3. sub-graph
+line("3. SUB-GRAPH (Cell 16 traverse)")
+edges = r["edges"]
+print(f"edges: {len(edges)}   by hop: {dict(sorted(Counter(e['hop'] for e in edges).items()))}")
+preds = Counter(e["predicate"] for e in edges)
+print("most common predicates:", preds.most_common(8))
+junk = [p for p in preds if p.endswith("Statement") or p in {"hyperlink"} or p.isdigit()]
+print("junk predicates (should be empty):", junk)
+for e in sorted(edges, key=lambda e: (e["hop"], -e["strength"]))[:8]:
+    print(f"  hop {e['hop']}  {e['source_label'][:40]} --[{e['predicate']}, {e['strength']}]--> {e['target_label'][:40]}")
+
+# ---------------------------------------------------------------- 4. documents
+line("4. A1/A2 DOCUMENTS chosen and fetched")
+for u, d in sorted(r["docs"].items(), key=lambda kv: (kv[1]["hop"], -kv[1]["evidence"])):
+    tag = "seed" if d["is_seed"] else ("link" if d.get("via_inline") else f"hop{d['hop']}")
+    txt = r["texts"].get(u, {}).get("content", "")
+    print(f"  [{tag:5}] {r['texts'][u]['label'][:60]:60}  text={len(txt):6} chars")
+print("documents with EMPTY text (should be none):",
+      [r["texts"][u]["label"] for u in r["docs"] if not r["texts"].get(u, {}).get("content")])
+
+# ---------------------------------------------------------------- 5. per document
+line("5. A3/A4 PER DOCUMENT: chunks kept (standard PageRank inside the doc)")
+by_doc = defaultdict(list)
+for c in r["candidates"]:
+    by_doc[c["doc_uri"]].append(c)
+for u in r["docs"]:
+    n_chunks = len(_CHUNK_CACHE.get(u, []))
+    kept = sorted(by_doc.get(u, []), key=lambda c: -c["local_pr"])
+    print(f"\n  {r['texts'][u]['label'][:70]}   ({n_chunks} chunks -> {len(kept)} kept)")
+    for c in kept:
+        print(f"     #{c['index']:<3} local={c['local_pr']:.2f} query_hits={c['query_hits']}  "
+              f"\"{c['text'][:90].replace(chr(10), ' ')}...\"")
+
+# ---------------------------------------------------------------- 6. final ranking
+line(f"6. A5 FINAL RANKING (standard PageRank over all chunks)  -  top {SHOW_TOP}")
+print(f"candidates: {len(r['ranked_chunks'])}   PageRank rounds: {r.get('pr_iterations')}")
+for i, c in enumerate(r["ranked_chunks"][:SHOW_TOP], 1):
+    print(f"\n  {i:2}. score={c['score']:.3f}  PR={c['pagerank']:.4f}  hop={c['hop']}  "
+          f"links={c['links']}  query_hits={c['query_hits']}")
+    print(f"      [{c['doc_label'][:70]} #{c['index']}]")
+    print("      " + c["text"][:PREVIEW].replace("\n", " ") + ("..." if len(c["text"]) > PREVIEW else ""))
+    if c.get("mentions"):
+        print("      mentions:", [_LABEL17.get(m, m)[:30] for m in list(c["mentions"])[:5]])
+
+# ---------------------------------------------------------------- 7. relationships
+line("7. TOP RELATIONSHIPS (for the context in 17B)")
+for e in r["relationships"][:10]:
+    print(f"  {e['rel_score']:.3f}  {e['source_label'][:35]} --[{e['predicate']}, {e['strength']}]--> {e['target_label'][:35]}")
+
+# ---------------------------------------------------------------- 8. checks
+line("8. QUICK CHECKS")
+rc = r["ranked_chunks"]
+checks = [
+    ("seeds found",                         bool(r["seeds"])),
+    ("sub-graph has edges",                 bool(edges)),
+    ("no junk predicates",                  not junk),
+    ("documents fetched with text",         bool(r["texts"]) and all(r["texts"][u]["content"] for u in r["docs"])),
+    ("<= CHUNKS_PER_DOC chunks per doc",    all(len(v) <= CHUNKS_PER_DOC for v in by_doc.values())),
+    ("ranked chunks exist",                 bool(rc)),
+    ("scores sorted, best = 1.0",           bool(rc) and abs(rc[0]["score"] - 1.0) < 1e-9
+                                            and all(a["score"] >= b["score"] for a, b in zip(rc, rc[1:]))),
+    ("top chunk contains a query word",     bool(rc) and rc[0]["query_hits"] > 0),
+    ("a seed document is in the top 5",     any(c["is_seed"] for c in rc[:5])),
+]
+for name, ok in checks:
+    print(("  PASS  " if ok else "  FAIL  ") + name)
+print("\nIf a check FAILS, send me sections 2-8 of this output.")
