@@ -24,6 +24,10 @@
 #   8. Edge de-duplication uses the predicate URI, not its display label.
 #   9. Node ids are converted to plain str (rdflib URIRef != str), so
 #      membership tests like `x in CONTENT_NODES` never fail silently.
+#  10. PREDICATE_MARKER is always quoted, so the label-substring query (Pass 1
+#      and Pass 3) parses. It failed with "Expected SelectQuery, found FILTER".
+#  11. Fuzzy match (Pass 2) runs only when Pass 1 found nothing, so an exact
+#      title match is not diluted by look-alikes (oil system -> air system).
 # ==============================================================================
 import re
 from collections import defaultdict
@@ -56,6 +60,7 @@ HOP_DIRECTIONS         = {1: "out", 2: "out"}  # "out" = follow links, "both" = 
 HOP1_EDGE_SHARE        = 0.6                   # hop 1 may use 60% of MAX_EDGES
 PROMOTE_ENTITY_SEEDS   = True                  # entity seed -> documents that link to it
 PARENT_DOCS_PER_ENTITY = 2                     # strongest parent documents kept per entity
+FUZZY_ONLY_IF_NO_SUBSTRING = True              # NEW: skip fuzzy when Pass 1 already matched
 
 # ------------------------------------------------------------------------------
 # SPARQL templates
@@ -158,10 +163,15 @@ def _tokens(s):
     return {t for t in re.findall(r"[a-z0-9]+", (s or "").lower())
             if t not in _STOP and len(t) > 2}
 
+_BAD_IRI_CHARS = re.compile(r'[\s<>"{}|^`\\]')   # NEW: not allowed inside <...> in SPARQL
+
 def _values_block(uris):
-    """URIs -> '<u1> <u2> ...'. Skips anything that would break the query."""
-    return " ".join(f"<{u}>" for u in uris
-                    if u and "<" not in u and ">" not in u and not re.search(r"\s", u))
+    """URIs -> '<u1> <u2> ...'. Skips any URI that would break the whole query
+    (spaces, quotes, braces, | ^ ` \\) and reports how many were skipped."""
+    good = [u for u in uris if u and not _BAD_IRI_CHARS.search(u)]
+    if len(good) < len([u for u in uris if u]):                              # NEW
+        print(f"  skipped {len(uris) - len(good)} URI(s) with characters SPARQL cannot accept")
+    return " ".join(f"<{u}>" for u in good)
 
 def _sparql_literal(s):
     s = (s.replace("\\", "\\\\").replace('"', '\\"')
@@ -202,11 +212,17 @@ def _row_to_edge(row, hop, seed_score):
         "seed_score":   seed_score,
     }
 
+# PREDICATE_MARKER must be a quoted SPARQL string inside STRSTARTS(...).
+# If Cell 15 defines it as a bare URL (http://...) or <http://...>, rdflib fails
+# with "Expected SelectQuery, found 'FILTER'". Quote it here either way.   # NEW
+_pm = str(PREDICATE_MARKER).strip()
+_PREDMARK_LIT = _pm if _pm.startswith('"') else _sparql_literal(_pm.strip("<>"))  # NEW
+
 def _substring_nodes(text):
     """Label-substring lookup. Returns list of node URIs, or None on failure."""
     q = (SUBSTRING_TMPL
          .replace("%PHRASE%", _sparql_literal(text.lower()))
-         .replace("%PREDMARK%", PREDICATE_MARKER)
+         .replace("%PREDMARK%", _PREDMARK_LIT)                                # NEW
          .replace("%LIMIT%", str(MAX_SEEDS_PER_PHRASE + 1)))
     try:
         return [str(r.node) for r in g.query(q)]
@@ -242,7 +258,9 @@ def link_entities(phrases):
                 _keep(node, 95.0, phrase)
                 phrase_hit = True
 
-        # --- Pass 2: fuzzy match ----------------------------------------------
+        # --- Pass 2: fuzzy match (only if Pass 1 found nothing) --------------
+        if phrase_hit and FUZZY_ONLY_IF_NO_SUBSTRING:                         # NEW
+            continue
         for label_lc, score in fuzzy_match(phrase.lower(), ALL_LABELS,
                                            MAX_SEEDS_PER_PHRASE, MATCH_CUTOFF):
             for node in LABEL_TO_NODES.get(label_lc, []):
