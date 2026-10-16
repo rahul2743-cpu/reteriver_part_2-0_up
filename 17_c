@@ -374,3 +374,17 @@ def visualize_query_graph(res, answer=None, max_edges=150, max_chunks=30,
 
 
 print("Defined: visualize_query_graph(res, answer=None, show_terms=False)")
+
+
+
+QUERY = "What is meant by Service Operation in terms of Rolls Royce Context ?"
+
+ans  = kg_answer(QUERY, verbose=False)        # runs retrieval + answer
+res  = ans["retrieval"]                       # the part the graph needs
+
+print("seeds :", len(res["seeds"]))
+print("edges :", len(res["edges"]))
+print("chunks:", len(res["ranked_chunks"]))
+
+html = visualize_query_graph(res, answer=ans, show_terms=True)
+displayHTML(html)                             # this line draws it in Databricks
