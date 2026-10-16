@@ -19,7 +19,11 @@
 import re
 from rdflib import Literal, URIRef, RDF, Namespace, XSD
 
-EX = Namespace(f"{KB_BASE}schema/")
+# Base URI of the graph: KB_BASE (Cell 14) -> BASE (Cell 11) -> literal default
+_KG_ROOT = (globals().get("KB_BASE") or globals().get("KG_BASE")
+            or globals().get("BASE") or "http://knwbt.local/kg/")
+EX = Namespace(f"{_KG_ROOT}schema/")
+print(f"Graph base URI: {_KG_ROOT}")
 CHUNK_BUILD_MAX_CHARS = 4000   # safety cap; not used to cut text, just reported
 
 # ------------------------------------------------------------------------------
@@ -145,7 +149,7 @@ def _pick_relevant(question, phrases, docs, chunk_map):
 # ------------------------------------------------------------------------------
 # 4. Replacement retrieve_chunks (graph -> subgraph -> relevant chunks -> rank)
 # ------------------------------------------------------------------------------
-_retrieve_chunks_full = retrieve_chunks          # keep the 17A version
+_retrieve_chunks_full = globals().get("_retrieve_chunks_full", retrieve_chunks)   # keep the 17A version (safe on re-run)
 
 def retrieve_chunks_relevant(question, verbose=True):
     phrases, seeds, fallback = get_seeds(question, verbose)
