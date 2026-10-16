@@ -1,0 +1,372 @@
+# ==============================================================================
+# CELL 17C - RELEVANT CHUNKS ONLY (no full-article fetch at query time)
+#
+# What changes vs 17A:
+#   * Chunks are stored IN THE GRAPH once (build_chunk_nodes), each as an
+#     ex:Chunk node with ex:chunkOf / ex:chunkIndex / ex:chunkText.
+#   * At query time, fetch_relevant_chunks() asks SPARQL only for chunks whose
+#     text contains a query word or phrase (plus chunk 0 for seed documents
+#     that match nothing). Full document text is never fetched.
+#   * retrieve_chunks is replaced, so kg_answer() (17B) uses this version.
+#
+# Run AFTER Cell 17A and 17B. Then call build_chunk_nodes() once
+# (and again if the graph g is rebuilt in Cell 11).
+# Needs: g, PREFIXES, KB_BASE, _LABEL17, _values, _tok, chunk_text,
+#        CHUNK_CHARS, CHUNK_OVERLAP, CHUNKS_PER_DOC, get_seeds, traverse,
+#        select_documents, query_nodes, rank_chunks_in_doc,
+#        rank_chunks_global, rank_relationships
+# ==============================================================================
+import re
+from rdflib import Literal, URIRef, RDF, Namespace, XSD
+
+EX = Namespace(f"{KB_BASE}schema/")
+CHUNK_BUILD_MAX_CHARS = 4000   # safety cap; not used to cut text, just reported
+
+# ------------------------------------------------------------------------------
+# 1. ONE-TIME BUILD: documents -> chunk nodes in the graph
+# ------------------------------------------------------------------------------
+def build_chunk_nodes(size=None, overlap=None, force=False):
+    """Split every ex:Document's text once and store each chunk in g.
+    Documents that already have chunks are skipped unless force=True."""
+    size = size or CHUNK_CHARS
+    overlap = CHUNK_OVERLAP if overlap is None else overlap
+    q = PREFIXES + """
+    SELECT ?doc ?content WHERE {
+      ?doc a ex:Document ; ex:documentContent ?content .
+    }"""
+    n_docs = n_chunks = n_skipped = 0
+    for row in list(g.query(q)):
+        doc = URIRef(str(row.doc))
+        if not force and (doc, EX.hasChunk, None) in g:
+            n_skipped += 1
+            continue
+        if force:
+            for cn in list(g.objects(doc, EX.hasChunk)):
+                g.remove((cn, None, None))
+            g.remove((doc, EX.hasChunk, None))
+            g.remove((doc, EX.chunkCount, None))
+        texts = chunk_text(str(row.content), size, overlap)
+        for i, t in enumerate(texts):
+            cn = URIRef(f"{doc}/chunk/{i}")
+            g.add((cn, RDF.type, EX.Chunk))
+            g.add((cn, EX.chunkOf, doc))
+            g.add((doc, EX.hasChunk, cn))
+            g.add((cn, EX.chunkIndex, Literal(i, datatype=XSD.integer)))
+            g.add((cn, EX.chunkText, Literal(t)))
+        g.add((doc, EX.chunkCount, Literal(len(texts), datatype=XSD.integer)))
+        n_docs += 1
+        n_chunks += len(texts)
+    print(f"Chunk nodes built: {n_chunks} chunks for {n_docs} documents "
+          f"({n_skipped} already built, skipped)")
+    return n_chunks
+
+# ------------------------------------------------------------------------------
+# 2. QUERY TIME: fetch only the relevant chunks
+# ------------------------------------------------------------------------------
+def _term_filter(terms, phrase_lc):
+    """SPARQL FILTER: chunk text contains at least one query word or phrase."""
+    needles = sorted({t for t in terms if t} | {p for p in phrase_lc if p})
+    if not needles:
+        return None
+    return "FILTER(" + " || ".join(
+        f"CONTAINS(LCASE(STR(?text)), {_sparql_literal(n)})" for n in needles) + ")"
+
+def fetch_relevant_chunks(doc_uris, terms, phrase_lc, seed_docs=()):
+    """{doc_uri: [chunk dict]} containing ONLY chunks that match the query,
+    plus chunk 0 of seed documents that match nothing."""
+    out = defaultdict(list)
+    block = _values(doc_uris)
+    if not block:
+        return {}
+    flt = _term_filter(terms, phrase_lc)
+    if flt:
+        q = PREFIXES + f"""
+        SELECT ?doc ?idx ?text WHERE {{
+          VALUES ?doc {{ {block} }}
+          ?chunk ex:chunkOf ?doc ; ex:chunkIndex ?idx ; ex:chunkText ?text .
+          {flt}
+        }}"""
+        try:
+            for r in g.query(q):
+                out[str(r.doc)].append((int(r.idx), str(r.text)))
+        except Exception as e:
+            print(f"  relevant-chunk query failed: {e}")
+
+    # seed documents with no matching chunk -> keep their first chunk
+    need0 = [u for u in seed_docs if u in set(doc_uris) and not out.get(u)]
+    if need0:
+        q0 = PREFIXES + f"""
+        SELECT ?doc ?idx ?text WHERE {{
+          VALUES ?doc {{ {_values(need0)} }}
+          ?chunk ex:chunkOf ?doc ; ex:chunkIndex ?idx ; ex:chunkText ?text .
+          FILTER(?idx = 0)
+        }}"""
+        try:
+            for r in g.query(q0):
+                out[str(r.doc)].append((int(r.idx), str(r.text)))
+        except Exception as e:
+            print(f"  seed chunk-0 query failed: {e}")
+
+    result = {}
+    for u, items in out.items():
+        label = _LABEL17.get(u, u)
+        n_total = _int(next(iter(g.objects(URIRef(u), EX.chunkCount)), 0))
+        chunks = [{"doc_uri": u, "doc_label": label, "index": i, "n_chunks": n_total,
+                   "text": t, "tokens": _tok(label + " " + t)}
+                  for i, t in sorted(items)]
+        result[u] = chunks
+    return result
+
+# ------------------------------------------------------------------------------
+# 3. Candidate selection (same rules as 17A A4, on relevant chunks only)
+# ------------------------------------------------------------------------------
+def _pick_relevant(question, phrases, docs, chunk_map):
+    terms, phrase_lc = query_nodes(question, phrases)
+    candidates, per_doc = [], {}
+    for u, d in docs.items():
+        chunks = chunk_map.get(u, [])
+        if not chunks:
+            continue
+        pr, hits, iters = rank_chunks_in_doc(chunks, terms, phrase_lc)
+        relevant = [c for c in chunks if hits[c["index"]] > 0]
+        if relevant:
+            keep = sorted(relevant, key=lambda c: -pr[c["index"]])[:CHUNKS_PER_DOC]
+        else:
+            keep = chunks[:1] if d["is_seed"] else []
+        best = max((pr[c["index"]] for c in keep), default=0.0) or 1.0
+        for c in keep:
+            cand = dict(c)
+            cand.update(id=f"{u}#{c['index']}", hop=d["hop"], is_seed=d["is_seed"],
+                        local_pr=pr[c["index"]] / best, query_hits=hits[c["index"]])
+            candidates.append(cand)
+        per_doc[u] = (len(chunks), len(keep), iters)
+    return candidates, per_doc, (terms, phrase_lc)
+
+# ------------------------------------------------------------------------------
+# 4. Replacement retrieve_chunks (graph -> subgraph -> relevant chunks -> rank)
+# ------------------------------------------------------------------------------
+_retrieve_chunks_full = retrieve_chunks          # keep the 17A version
+
+def retrieve_chunks_relevant(question, verbose=True):
+    phrases, seeds, fallback = get_seeds(question, verbose)
+    res = {"question": question, "phrases": phrases, "seeds": seeds, "fallback_used": fallback,
+           "edges": [], "docs": {}, "texts": {}, "candidates": [], "ranked_chunks": [],
+           "relationships": []}
+    if not seeds:
+        if verbose:
+            print("  no seeds - nothing to retrieve")
+        return res
+
+    edges, visited = traverse(seeds)                                   # graph walk, no text
+    docs, doc_links = select_documents(seeds, edges, visited)          # which documents
+    terms, phrase_lc = query_nodes(question, phrases)
+    seed_docs = {u for u, d in docs.items() if d["is_seed"]}
+    chunk_map = fetch_relevant_chunks(list(docs), terms, phrase_lc, seed_docs)   # ONLY relevant chunks
+    candidates, per_doc, query = _pick_relevant(question, phrases, docs, chunk_map)
+    subgraph_nodes = {str(k) for k in visited} | set(docs) | {s[0] for s in seeds}
+    ranked, adj, iters = rank_chunks_global(candidates, seeds, doc_links,
+                                            subgraph_nodes, query)     # A5 (unchanged)
+
+    texts = {u: {"label": _LABEL17.get(u, u), "content": None} for u in docs}  # label only
+    res.update(edges=edges, docs=docs, texts=texts, candidates=candidates,
+               ranked_chunks=ranked, relationships=rank_relationships(edges, seeds),
+               chunk_graph=adj, pr_iterations=iters)
+    if verbose:
+        print(f"\nQ : {question}")
+        print(f"  seeds     : {[(l, round(s, 1)) for _, l, s, _ in seeds]}"
+              + ("  (FALLBACK)" if fallback else ""))
+        print(f"  edges     : {len(edges)}   documents in subgraph: {len(docs)}   "
+              f"documents with relevant chunks: {len(chunk_map)}")
+        print(f"  relevant chunks fetched: {sum(len(v) for v in chunk_map.values())}   "
+              f"kept after ranking: {len(ranked)}")
+        for c in ranked[:10]:
+            print(f"    {c['score']:.3f}  PR={c['pagerank']:.4f} hop={c['hop']} "
+                  f"{c['doc_label'][:45]} #{c['index']}")
+    return res
+
+# Make kg_answer (17B) use the relevant-chunks retriever
+retrieve_chunks = retrieve_chunks_relevant
+
+print("Defined: build_chunk_nodes, fetch_relevant_chunks, retrieve_chunks_relevant")
+print("retrieve_chunks now uses relevant chunks only. Run build_chunk_nodes() once.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-------------=============================?????>>>>>>>>>>>>>>>>>>>>>>>
+
+# ==============================================================================
+# CELL 18 - PYVIS VISUALIZATION: QUERY -> SEEDS -> HOPS -> RELEVANT CHUNKS
+#
+# Draws, for ONE question:
+#   * QUERY node (black star)
+#   * seed nodes  (hop 0, red)      -- documents = boxes, entities = dots
+#   * hop-1 nodes (orange), hop-2 nodes (green)
+#   * traversal edges (label = predicate, thickness = strength, hover = description)
+#   * relevant chunks kept after ranking (blue), attached to their document;
+#     size = ranking score; chunks actually sent to the LLM are purple
+#   * optional: query-word nodes linking QUERY -> word -> chunk (show_terms=True)
+#
+# Usage (Databricks):
+#   %pip install pyvis          <- once, in its own cell
+#   ans  = kg_answer(QUERY, verbose=False)              # or retrieve_chunks(QUERY)
+#   html = visualize_query_graph(ans["retrieval"], answer=ans)
+#   displayHTML(html)
+#
+# Works with both the 17A retriever and the 17C relevant-chunks retriever.
+# ==============================================================================
+import html as _html
+from pyvis.network import Network
+
+HOP_COLORS   = {0: "#d62728", 1: "#ff7f0e", 2: "#2ca02c"}
+QUERY_COLOR  = "#222222"
+CHUNK_COLOR  = "#1f77b4"
+CHOSEN_COLOR = "#9467bd"
+TERM_COLOR   = "#bbbbbb"
+
+
+def _short(s, n=40):
+    s = str(s)
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _tip(*lines):
+    """Hover text (plain text, escaped)."""
+    return "\n".join(_html.escape(str(l)) for l in lines if l is not None)
+
+
+_LEGEND = """
+<div style="position:fixed;top:10px;left:10px;z-index:999;background:#fff;
+            border:1px solid #ccc;padding:8px 12px;font:12px sans-serif;line-height:1.7">
+  <b>Legend</b><br>
+  <span style="color:#222">&#9733;</span> Query<br>
+  <span style="color:#d62728">&#9632;</span> Hop 0 (seed)
+  <span style="color:#ff7f0e">&#9632;</span> Hop 1
+  <span style="color:#2ca02c">&#9632;</span> Hop 2<br>
+  &#9645; box = document &nbsp; &#9679; dot = entity<br>
+  <span style="color:#1f77b4">&#9670;</span> relevant chunk (size = score)<br>
+  <span style="color:#9467bd">&#9670;</span> chunk sent to the LLM
+</div>
+"""
+
+
+def visualize_query_graph(res, answer=None, max_edges=150, max_chunks=30,
+                          show_terms=False, out_path="/tmp/kg_query_graph.html",
+                          height="850px"):
+    """res    = dict from retrieve_chunks(...)   (or kg_answer(...)["retrieval"])
+       answer = dict from kg_answer(...)  -> marks the chunks sent to the LLM
+       Returns the HTML string (use displayHTML(html) in Databricks)."""
+    net = Network(height=height, width="100%", directed=True,
+                  bgcolor="#ffffff", font_color="#222222", cdn_resources="in_line")
+    net.barnes_hut(gravity=-9000, central_gravity=0.25, spring_length=150)
+
+    content_nodes = globals().get("CONTENT_NODES") or set(res.get("texts", {}))
+    content_nodes = {str(n) for n in content_nodes}
+    chosen = {c["id"] for c in (answer or {}).get("top_chunks", [])}
+
+    # ---- labels + hop of every node ---------------------------------------
+    labels, hop_of, seed_score = {}, {}, {}
+    for n, l, s, p in res["seeds"]:
+        labels[n], hop_of[n], seed_score[n] = l, 0, (s, p)
+    edges = sorted(res["edges"], key=lambda e: (e["hop"], -e["strength"]))[:max_edges]
+    for e in edges:
+        for side in ("source", "target"):
+            labels.setdefault(e[side], e[f"{side}_label"])
+            hop_of.setdefault(e[side], e["hop"])
+    for u, d in res.get("docs", {}).items():
+        labels.setdefault(u, res.get("texts", {}).get(u, {}).get("label", u))
+        hop_of.setdefault(u, d["hop"])
+
+    # ---- QUERY node ---------------------------------------------------------
+    net.add_node("QUERY", label=_short(res["question"], 60), shape="star", size=40,
+                 color=QUERY_COLOR, title=_tip("QUERY", res["question"],
+                 "entities: " + ", ".join(p for p, _ in res.get("phrases", []))))
+
+    # ---- graph nodes (seeds, hop 1, hop 2) -------------------------------
+    for n, lbl in labels.items():
+        hop = min(int(hop_of.get(n, 2)), 2)
+        is_doc = n in content_nodes
+        doc_info = res.get("docs", {}).get(n, {})
+        tip = [lbl, f"hop {hop}", "document" if is_doc else "entity"]
+        if n in seed_score:
+            tip.append(f"seed score {seed_score[n][0]:.0f} via '{seed_score[n][1]}'")
+        if doc_info:
+            tip.append(f"selected document (evidence {doc_info.get('evidence', 0):.2f})")
+        net.add_node(n, label=_short(lbl), title=_tip(*tip),
+                     shape="box" if is_doc else "dot",
+                     color=HOP_COLORS[hop],
+                     size=30 if hop == 0 else (20 if hop == 1 else 14),
+                     borderWidth=3 if doc_info else 1,
+                     font={"color": "#ffffff" if is_doc else "#222222"})
+
+    # ---- QUERY -> seed edges -----------------------------------------------
+    for n, l, s, p in res["seeds"]:
+        net.add_edge("QUERY", n, label=f"seed {s:.0f}", color="#888888",
+                     dashes=True, width=2, title=_tip(f"matched phrase: {p}"))
+
+    # ---- traversal edges -----------------------------------------------------
+    for e in edges:
+        net.add_edge(e["source"], e["target"],
+                     label=_short(e["predicate"], 25),
+                     width=1 + e["strength"] / 2.5,
+                     color=HOP_COLORS[min(int(e["hop"]), 2)],
+                     title=_tip(f"{e['source_label']} --[{e['predicate']}, "
+                                f"strength {e['strength']}, hop {e['hop']}]--> {e['target_label']}",
+                                e["description"]))
+
+    # ---- relevant chunks (after ranking) ----------------------------------
+    ranked = res.get("ranked_chunks", [])[:max_chunks]
+    for c in ranked:
+        cid = f"chunk::{c['id']}"
+        doc = c["doc_uri"]
+        if doc not in labels:                      # doc not drawn yet
+            labels[doc] = c["doc_label"]
+            net.add_node(doc, label=_short(c["doc_label"]), shape="box",
+                         color=HOP_COLORS[min(int(c.get("hop", 2)), 2)],
+                         font={"color": "#ffffff"})
+        is_chosen = c["id"] in chosen
+        net.add_node(cid, label=f"#{c['index']}  {c['score']:.2f}",
+                     shape="diamond", size=8 + 22 * c["score"],
+                     color=CHOSEN_COLOR if is_chosen else CHUNK_COLOR,
+                     title=_tip(f"{c['doc_label']}  chunk #{c['index']}",
+                                f"score {c['score']:.3f}   PageRank {c['pagerank']:.4f}   "
+                                f"query hits {c.get('query_hits', '?')}",
+                                "SENT TO LLM" if is_chosen else "",
+                                "-" * 40, c["text"][:500]))
+        net.add_edge(doc, cid, color=CHOSEN_COLOR if is_chosen else CHUNK_COLOR,
+                     dashes=True, width=1, title="chunk of")
+
+    # ---- optional: QUERY -> word -> chunk ---------------------------------
+    if show_terms and ranked and "query_nodes" in globals():
+        terms, phrase_lc = query_nodes(res["question"], res.get("phrases", []))
+        for t in sorted(terms) + list(phrase_lc):
+            tid = f"term::{t}"
+            hits = [c for c in ranked
+                    if (t in c.get("tokens", []) if " " not in t else t in c["text"].lower())]
+            if not hits:
+                continue
+            net.add_node(tid, label=t, shape="ellipse", color=TERM_COLOR, size=10)
+            net.add_edge("QUERY", tid, color=TERM_COLOR, width=1)
+            for c in hits:
+                net.add_edge(tid, f"chunk::{c['id']}", color=TERM_COLOR, width=1)
+
+    html = net.generate_html()
+    html = html.replace("<body>", "<body>" + _LEGEND, 1)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"Graph: {len(net.nodes)} nodes, {len(net.edges)} edges "
+          f"({len(ranked)} chunks, {len(chosen)} sent to LLM) -> {out_path}")
+    return html
+
+
+print("Defined: visualize_query_graph(res, answer=None, show_terms=False)")
