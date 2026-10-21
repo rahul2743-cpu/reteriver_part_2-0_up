@@ -1,0 +1,480 @@
+# ==========================================================
+# CELL 17 - APPROACH 1 : PAGERANK (DOCUMENTS) + BM25 (CHUNKS)
+#
+#   question -> subgraph (Cell 15 + 16)
+#            -> Personalized PageRank on the subgraph   (NODE level)
+#            -> top MAX_DOCS documents by PageRank      (PageRank = document filter)
+#            -> chunk those documents
+#            -> BM25 score per chunk                    (CHUNK level)
+#            -> top-K chunks by BM25 (max MAX_PER_DOC per document) -> Cell 18
+#
+# Standard methods:
+#   Personalized PageRank - Haveliwala (2002)
+#   Okapi BM25            - Robertson & Zaragoza (2009)
+#
+# Needs: G (Cell 12),
+#        extract_query_entities (Cell 15),
+#        link_entities, content_search, lexical_fallback, traverse, _STOP (Cell 16),
+#        QUERY (Cell 13)
+# ==========================================================
+import re
+import math
+from collections import Counter, defaultdict
+
+import networkx as nx
+import pandas as pd
+
+print("=" * 80)
+print("CELL 17 - APPROACH 1 : PAGERANK (DOCUMENTS) + BM25 (CHUNKS)")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------
+PPR_DAMPING    = 0.85    # standard PageRank damping factor
+MAX_DOCS       = 6       # documents kept after PageRank
+CHUNK_SIZE     = 900     # target characters per chunk
+MIN_CHUNK_SIZE = 120     # shorter pieces are merged into a neighbour (never dropped)
+BM25_K1        = 1.5     # standard range 1.2 - 2.0
+BM25_B         = 0.75    # standard value
+TOP_K          = 10
+MAX_PER_DOC    = 3
+
+
+# ----------------------------------------------------------
+# STEP 0 : SUBGRAPH FOR A QUESTION  (wraps Cell 15 + Cell 16)
+# ----------------------------------------------------------
+def get_subgraph(question):
+    """question -> (phrases, seeds, edges, visited)."""
+    phrases = extract_query_entities(question)
+
+    seeds = link_entities(phrases) if phrases else []
+
+    # phrases that linked to nothing -> search document text
+    linked = {s[3] for s in seeds}
+    for phrase, _cls in phrases:
+        if phrase not in linked:
+            seeds += content_search(phrase)
+
+    # still nothing -> plain word-overlap fallback
+    if not seeds:
+        seeds = lexical_fallback(question, limit=5)
+
+    # one entry per node, keep the best score
+    best = {}
+    for s in seeds:
+        if s[0] not in best or s[2] > best[s[0]][2]:
+            best[s[0]] = s
+    seeds = sorted(best.values(), key=lambda s: -s[2])
+
+    edges, visited = traverse(seeds)
+    return phrases, seeds, edges, visited
+
+
+# ----------------------------------------------------------
+# STEP 1 : CHUNKING  (built once for all documents, kept in memory)
+# ----------------------------------------------------------
+# Document text in G is Cell 8d's content_with_titles, which has NO newlines,
+# so chunks are packed from SENTENCES. The lookahead stops a split inside a
+# <Link Title> marker.
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?![^<]*>)")
+
+
+def chunk_text(text, size=CHUNK_SIZE, min_size=MIN_CHUNK_SIZE):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]                       # short document -> one chunk
+
+    pieces = []
+    for sent in _SENT_SPLIT.split(text):
+        while len(sent) > size:             # a single very long sentence
+            cut = sent.rfind(" ", 0, size)
+            cut = cut if cut > 0 else size
+            pieces.append(sent[:cut].strip())
+            sent = sent[cut:].strip()
+        if sent:
+            pieces.append(sent)
+
+    chunks, cur = [], ""
+    for p in pieces:
+        if cur and len(cur) + 1 + len(p) > size:
+            chunks.append(cur)
+            cur = p
+        else:
+            cur = f"{cur} {p}".strip()
+    if cur:
+        chunks.append(cur)
+
+    # merge short chunks into a neighbour so no text is lost
+    merged = []
+    for c in chunks:
+        if merged and (len(c) < min_size or len(merged[-1]) < min_size):
+            merged[-1] = f"{merged[-1]} {c}"
+        else:
+            merged.append(c)
+    return merged
+
+
+def _terms(text):
+    """Lower-case words, stop words removed, trailing plural 's' stripped
+    (same rule as Cell 15's _normalize)."""
+    out = []
+    for w in re.findall(r"[a-z0-9]+", (text or "").lower()):
+        if w in _STOP or len(w) < 2:
+            continue
+        out.append(w[:-1] if len(w) > 3 and w.endswith("s") else w)
+    return out
+
+
+CHUNKS = []
+for doc, attrs in G.nodes(data=True):
+    if attrs.get("node_type") != "document":
+        continue
+    for i, txt in enumerate(chunk_text(attrs.get("content", ""))):
+        tf = Counter(_terms(txt))
+        CHUNKS.append({
+            "chunk_id": f"{doc}#{i}",
+            "doc": doc,
+            "title": attrs.get("label", doc),
+            "chunk_index": i,
+            "text": txt,
+            "tf": tf,
+            "len": sum(tf.values()),
+        })
+
+CHUNKS_BY_DOC = defaultdict(list)
+for ch in CHUNKS:
+    CHUNKS_BY_DOC[ch["doc"]].append(ch)
+
+# ----------------------------------------------------------
+# STEP 2 : BM25 INDEX  (over ALL chunks, so word rarity is measured globally)
+# ----------------------------------------------------------
+N_CHUNKS = len(CHUNKS)
+AVG_LEN  = sum(c["len"] for c in CHUNKS) / max(N_CHUNKS, 1)
+DF       = Counter(t for c in CHUNKS for t in c["tf"])   # chunks containing each word
+
+
+def idf(term):
+    n = DF.get(term, 0)
+    return math.log((N_CHUNKS - n + 0.5) / (n + 0.5) + 1)
+
+
+def bm25(q_terms, ch):
+    norm = BM25_K1 * (1 - BM25_B + BM25_B * ch["len"] / AVG_LEN) if AVG_LEN else BM25_K1
+    score = 0.0
+    for t in q_terms:
+        f = ch["tf"].get(t, 0)
+        if f:
+            score += idf(t) * f * (BM25_K1 + 1) / (f + norm)
+    return score
+
+
+print(f"Documents chunked : {len(CHUNKS_BY_DOC)}")
+print(f"Chunks built      : {N_CHUNKS}  (avg {AVG_LEN:.0f} terms per chunk)")
+
+
+# ----------------------------------------------------------
+# STEP 3 : PERSONALIZED PAGERANK  (NODE level, undirected subgraph)
+# ----------------------------------------------------------
+def personalized_pagerank(seeds, edges):
+    sub = nx.Graph()                                  # undirected on purpose
+    for n, _label, _score, _phrase in seeds:
+        sub.add_node(n)                               # seeds always present
+    for e in edges:
+        u, v, w = e["source"], e["target"], float(e["strength"])
+        if u == v:
+            continue
+        if sub.has_edge(u, v):
+            sub[u][v]["weight"] += w                  # several predicates -> sum
+        else:
+            sub.add_edge(u, v, weight=w)
+
+    if sub.number_of_nodes() == 0:
+        return sub, {}
+
+    pers = {n: max(score, 0) / 100.0 for n, _l, score, _p in seeds}
+    if sum(pers.values()) == 0:
+        pers = None                                   # no usable seed weights -> plain PageRank
+
+    ppr = nx.pagerank(sub, alpha=PPR_DAMPING, personalization=pers, weight="weight")
+    return sub, ppr
+
+
+# ----------------------------------------------------------
+# STEP 4 : RANK CHUNKS
+# ----------------------------------------------------------
+def _competition_ranks(items, key):
+    """Standard competition ranking ("1224"): equal scores share a rank,
+    the next rank skips. Rank 1 = best."""
+    scores = [key(x) for x in items]
+    return [1 + sum(1 for other in scores if other > s) for s in scores]
+
+
+def rank_chunks(question, phrases, seeds, edges):
+    """Returns (top_chunks, doc_ranking)."""
+
+    # >>> PAGERANK COMPUTED HERE: one score per NODE of the query subgraph
+    sub, ppr = personalized_pagerank(seeds, edges)
+    if not ppr:
+        return [], []
+
+    # >>> PAGERANK USED HERE (only place): choose WHICH DOCUMENTS to read.
+    #     Document nodes are sorted by PageRank and the top MAX_DOCS are kept.
+    #     Chunks of all other documents are never considered.
+    docs = sorted((n for n in ppr if n in CHUNKS_BY_DOC), key=lambda n: -ppr[n])[:MAX_DOCS]
+    if not docs:
+        return [], []
+
+    doc_ranks = _competition_ranks(docs, lambda d: ppr[d])
+    doc_ranking = [{
+        "doc": d,
+        "title": G.nodes[d].get("label", d),
+        "ppr": round(ppr[d], 4),
+        "ppr_rank": r,
+    } for d, r in zip(docs, doc_ranks)]
+
+    # --- query terms: question words + extracted phrase words ---
+    q_terms = set(_terms(question)) | {t for p, _ in phrases for t in _terms(p)}
+
+    # --- BM25 for every chunk of the selected documents ---
+    cands = []
+    for d in docs:
+        for ch in CHUNKS_BY_DOC[d]:
+            cands.append({
+                "chunk_id": ch["chunk_id"],
+                "doc": d,
+                "title": ch["title"],
+                "chunk_index": ch["chunk_index"],
+                "text": ch["text"],
+                "bm25": bm25(q_terms, ch),
+                "doc_ppr": ppr[d],      # for information only, not used in ranking
+            })
+
+    # keep chunks that match the question at least a little;
+    # if none match, fall back to the opening chunk of each document
+    pool = [c for c in cands if c["bm25"] > 0] or \
+           [c for c in cands if c["chunk_index"] == 0]
+
+    # >>> CHUNK RANKING = BM25 ONLY
+    for c, r in zip(pool, _competition_ranks(pool, lambda c: c["bm25"])):
+        c["bm25_rank"] = r
+
+    # --- top-K, max MAX_PER_DOC per document ---
+    pool.sort(key=lambda c: -c["bm25"])
+    picked, per_doc = [], Counter()
+    for c in pool:
+        if per_doc[c["doc"]] >= MAX_PER_DOC:
+            continue
+        picked.append(c)
+        per_doc[c["doc"]] += 1
+        if len(picked) >= TOP_K:
+            break
+
+    return picked, doc_ranking
+
+
+# ----------------------------------------------------------
+# RUN FOR QUERY
+# ----------------------------------------------------------
+phrases, seeds, edges, visited = get_subgraph(QUERY)
+top_chunks, doc_ranking = rank_chunks(QUERY, phrases, seeds, edges)
+
+print()
+print(f"QUERY    : {QUERY}")
+print(f"Phrases  : {phrases}")
+print(f"Seeds    : {len(seeds)}   Edges : {len(edges)} "
+      f"(hop1={sum(e['hop'] == 1 for e in edges)}, hop2={sum(e['hop'] == 2 for e in edges)})")
+
+print()
+print("DOCUMENT RANKING (Personalized PageRank, node level):")
+if doc_ranking:
+    display(pd.DataFrame(doc_ranking)[["title", "ppr", "ppr_rank"]])
+else:
+    print("  no documents in the subgraph")
+
+print()
+print(f"TOP {len(top_chunks)} CHUNKS (ranked by BM25):")
+if top_chunks:
+    display(pd.DataFrame(top_chunks)[[
+        "title", "chunk_index", "bm25", "bm25_rank", "doc_ppr", "text"
+    ]].round(4))
+else:
+    print("  no chunks selected")
+
+
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+========================================================>
+
+cell-18
+
+# ==========================================================
+# CELL 18 - CONTEXT BUILDING + LLM ANSWER
+#
+#   top_chunks (Cell 17)  +  relationships (edges, Cell 16)
+#        -> numbered context  [1] [2] ... within MAX_CONTEXT_CHARS
+#        -> LLM answers ONLY from the context, citing [n]
+#        -> citation check  -> answer + sources
+#
+# Needs: llm (Cell 12), get_subgraph + rank_chunks (Cell 17)
+# ==========================================================
+import re
+import pandas as pd
+
+print("=" * 80)
+print("CELL 18 - CONTEXT BUILDING + LLM ANSWER")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------
+MAX_CONTEXT_CHARS     = 14000   # total size of the context sent to the LLM
+INCLUDE_RELATIONSHIPS = True    # add knowledge-graph facts above the excerpts
+MAX_RELATIONSHIPS     = 15
+MAX_REL_CHARS         = 3000    # relationships may use at most this much of the budget
+
+ANSWER_SYSTEM_PROMPT = """You answer questions about technical documentation.
+
+Use ONLY the CONTEXT below. It contains numbered DOCUMENT EXCERPTS [1], [2], ...
+and, optionally, RELATIONSHIPS from a knowledge graph.
+
+Rules:
+- Answer only with information found in the context. Do not use outside knowledge.
+- After every sentence that uses an excerpt, cite it with its number, e.g. [1] or [2][3].
+- Relationships are supporting facts; cite the excerpt that supports a claim when possible.
+- If the context does not contain the answer, reply exactly:
+  "The provided documents do not contain enough information to answer this question."
+- Be concise and specific."""
+
+NO_ANSWER = "The provided documents do not contain enough information to answer this question."
+
+
+# ----------------------------------------------------------
+# STEP 1 : BUILD THE CONTEXT
+# ----------------------------------------------------------
+def build_context(top_chunks, edges):
+    """Returns (context_text, sources).
+    sources = one row per numbered excerpt actually placed in the context."""
+
+    # --- relationships: only edges touching the selected documents ---
+    rel_lines, rel_used = [], 0
+    if INCLUDE_RELATIONSHIPS and edges:
+        selected_docs = {c["doc"] for c in top_chunks}
+        related = [e for e in edges
+                   if e["source"] in selected_docs or e["target"] in selected_docs]
+        related.sort(key=lambda e: (-e["strength"], e["hop"]))
+        seen = set()
+        for e in related:
+            key = (e["source_label"], e["predicate"], e["target_label"])
+            if key in seen:
+                continue
+            seen.add(key)
+            line = (f"- {e['source_label']} --[{e['predicate']}]--> "
+                    f"{e['target_label']}: {e['description']}")
+            if rel_used + len(line) + 1 > MAX_REL_CHARS or len(rel_lines) >= MAX_RELATIONSHIPS:
+                break
+            rel_lines.append(line)
+            rel_used += len(line) + 1
+
+    # --- numbered excerpts, in Cell 17's BM25 order, within the budget ---
+    budget = MAX_CONTEXT_CHARS - rel_used
+    blocks, sources, used = [], [], 0
+    for c in top_chunks:
+        n = len(blocks) + 1
+        block = f"[{n}] (source: {c['title']})\n{c['text']}"
+        if used + len(block) + 2 > budget:
+            break
+        blocks.append(block)
+        used += len(block) + 2
+        sources.append({
+            "ref": n,
+            "title": c["title"],
+            "chunk_id": c["chunk_id"],
+            "bm25": round(c["bm25"], 4),
+        })
+
+    parts = ["DOCUMENT EXCERPTS:\n" + "\n\n".join(blocks)]
+    if rel_lines:
+        parts.insert(0, "RELATIONSHIPS:\n" + "\n".join(rel_lines))
+    return "\n\n".join(parts), sources
+
+
+# ----------------------------------------------------------
+# STEP 2 : CHECK THE CITATIONS IN THE ANSWER
+# ----------------------------------------------------------
+def check_citations(answer, sources):
+    """Which [n] the answer cites, and whether any cite a number
+    that does not exist in the context."""
+    cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", answer)})
+    valid = {s["ref"] for s in sources}
+    return {
+        "cited": cited,
+        "invalid": [n for n in cited if n not in valid],
+        "uncited_answer": (not cited) and answer.strip() != NO_ANSWER,
+    }
+
+
+# ----------------------------------------------------------
+# STEP 3 : FULL PIPELINE  question -> answer
+# ----------------------------------------------------------
+def answer_question(question):
+    phrases, seeds, edges, visited = get_subgraph(question)                  # Cell 15 + 16
+    top_chunks, doc_ranking = rank_chunks(question, phrases, seeds, edges)   # Cell 17
+
+    if not top_chunks:
+        return {"question": question, "answer": NO_ANSWER, "sources": [],
+                "context": "", "doc_ranking": doc_ranking, "seeds": seeds,
+                "citations": {"cited": [], "invalid": [], "uncited_answer": False}}
+
+    context, sources = build_context(top_chunks, edges)
+
+    resp = llm.invoke([
+        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION: {question}"},
+    ])
+    answer = resp.content if isinstance(resp.content, str) else str(resp.content)
+
+    return {
+        "question": question,
+        "answer": answer.strip(),
+        "sources": sources,
+        "context": context,
+        "doc_ranking": doc_ranking,
+        "seeds": seeds,
+        "citations": check_citations(answer, sources),
+    }
+
+
+# ----------------------------------------------------------
+# RUN FOR A QUESTION
+# ----------------------------------------------------------
+QUERY = "What is meant by service operation in the context of Rolls-Royce product?"   # <- type your question here
+
+result = answer_question(QUERY)
+
+print(f"QUESTION : {result['question']}")
+print()
+print("ANSWER   :")
+print(result["answer"])
+print()
+print(f"Context  : {len(result['context'])} chars (budget {MAX_CONTEXT_CHARS}), "
+      f"{len(result['sources'])} excerpts")
+
+cit = result["citations"]
+print(f"Cited    : {cit['cited'] or 'none'}")
+if cit["invalid"]:
+    print(f"WARNING  : answer cites excerpts that do not exist: {cit['invalid']}")
+if cit["uncited_answer"]:
+    print("WARNING  : answer has no citations - check it is grounded in the context")
+
+print()
+print("SOURCES:")
+if result["sources"]:
+    src_df = pd.DataFrame(result["sources"])
+    src_df["cited"] = src_df["ref"].isin(cit["cited"])
+    display(src_df[["ref", "title", "bm25", "cited", "chunk_id"]])
+else:
+    print("  none")
