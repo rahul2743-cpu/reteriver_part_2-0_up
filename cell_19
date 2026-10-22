@@ -1,0 +1,162 @@
+# ==========================================================
+# CELL 19 - GRAPH RETRIEVER : TOP-K CHUNKS WITH MMR
+#           (output in the same "predictions" format as a
+#            vector-search retriever, for side-by-side comparison)
+#
+#   question -> subgraph (Cells 15-16)
+#            -> Personalized PageRank -> top MAX_DOCS documents (Cell 17)
+#            -> BM25 on their chunks  -> best KG_FETCH_K candidates
+#            -> MMR (Maximal Marginal Relevance) -> K chunks
+#            -> {"predictions": [{"data": [{content, title, reference}, ...]}]}
+#            -> stored in response_kg
+#
+# MMR - Carbonell & Goldstein (1998):
+#     pick next  c = argmax [ lambda * relevance(c, query)
+#                             - (1 - lambda) * max_{s in selected} similarity(c, s) ]
+#     relevance  = BM25 score normalised to 0-1
+#     similarity = cosine similarity of TF-IDF vectors of the two chunks
+#     defaults k=10, fetch_k=20, lambda=0.5 are the same as LangChain's
+#     max_marginal_relevance_search, so both retrievers use equal settings.
+#
+# Needs: Cell 11 (g, BASE), Cell 17 (get_subgraph, personalized_pagerank,
+#        CHUNKS_BY_DOC, bm25, idf, _terms, MAX_DOCS)
+# ==========================================================
+import json
+import math
+
+print("=" * 80)
+print("CELL 19 - GRAPH RETRIEVER : TOP-K CHUNKS WITH MMR")
+print("=" * 80)
+
+# ----------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------
+KG_RETRIEVE_K = 10     # chunks returned (k)
+KG_FETCH_K    = 20     # BM25 candidates given to MMR (fetch_k)
+KG_MMR_LAMBDA = 0.5    # 1.0 = relevance only, 0.0 = diversity only
+
+
+# ----------------------------------------------------------
+# STEP 1 : DOCUMENT REFERENCE LOOKUP  (built once)
+# Cell 11 stores each document's original reference as ex:sourceReference.
+# ----------------------------------------------------------
+_KG_REF_QUERY = f"""
+PREFIX ex: <{BASE}schema/>
+SELECT ?doc ?ref
+WHERE {{ ?doc a ex:Document ; ex:sourceReference ?ref . }}
+"""
+KG_REF_BY_DOC = {str(r.doc): str(r.ref) for r in g.query(_KG_REF_QUERY)}
+print(f"Document references loaded : {len(KG_REF_BY_DOC)}")
+
+
+# ----------------------------------------------------------
+# STEP 2 : CANDIDATES  (PageRank document filter + BM25, same as Cell 17)
+# ----------------------------------------------------------
+def kg_candidate_chunks(question, phrases, seeds, edges):
+    """All chunks of the top MAX_DOCS PageRank documents, sorted by BM25 (best first).
+    Chunks with BM25 = 0 are dropped; if none match, each document's first chunk is used."""
+    _sub, ppr = personalized_pagerank(seeds, edges)
+    if not ppr:
+        return []
+    docs = sorted((n for n in ppr if n in CHUNKS_BY_DOC), key=lambda n: -ppr[n])[:MAX_DOCS]
+
+    q_terms = set(_terms(question)) | {t for p, _ in phrases for t in _terms(p)}
+    cands = [{**ch, "bm25": bm25(q_terms, ch)} for d in docs for ch in CHUNKS_BY_DOC[d]]
+
+    pool = [c for c in cands if c["bm25"] > 0] or [c for c in cands if c["chunk_index"] == 0]
+    pool.sort(key=lambda c: -c["bm25"])
+    return pool
+
+
+# ----------------------------------------------------------
+# STEP 3 : MMR
+# ----------------------------------------------------------
+_KG_VEC_CACHE = {}
+
+
+def _kg_tfidf_vector(ch):
+    """L2-normalised TF-IDF vector of a chunk (IDF from the Cell 17 BM25 index)."""
+    vec = _KG_VEC_CACHE.get(ch["chunk_id"])
+    if vec is None:
+        raw = {t: f * idf(t) for t, f in ch["tf"].items()}
+        norm = math.sqrt(sum(x * x for x in raw.values())) or 1.0
+        vec = {t: x / norm for t, x in raw.items()}
+        _KG_VEC_CACHE[ch["chunk_id"]] = vec
+    return vec
+
+
+def _kg_cosine(a, b):
+    if len(a) > len(b):
+        a, b = b, a
+    return sum(x * b.get(t, 0.0) for t, x in a.items())
+
+
+def kg_mmr_select(cands, k, lambda_mult):
+    """Standard greedy MMR over the candidate list."""
+    if not cands:
+        return []
+    top = max(c["bm25"] for c in cands)
+    relevance = {c["chunk_id"]: (c["bm25"] / top if top > 0 else 0.0) for c in cands}
+
+    selected, remaining = [], list(cands)
+    while remaining and len(selected) < k:
+        best, best_score = None, -math.inf
+        for c in remaining:
+            redundancy = max((_kg_cosine(_kg_tfidf_vector(c), _kg_tfidf_vector(s)) for s in selected),
+                             default=0.0)
+            score = lambda_mult * relevance[c["chunk_id"]] - (1 - lambda_mult) * redundancy
+            if score > best_score:          # strict '>' keeps BM25 order on ties
+                best, best_score = c, score
+        selected.append(best)
+        remaining = [c for c in remaining if c["chunk_id"] != best["chunk_id"]]
+    return selected
+
+
+# ----------------------------------------------------------
+# STEP 4 : RETRIEVER + PREDICTIONS OUTPUT
+# ----------------------------------------------------------
+def kg_graph_retrieve(question, k=KG_RETRIEVE_K, fetch_k=KG_FETCH_K,
+                   lambda_mult=KG_MMR_LAMBDA, use_mmr=True):
+    """question -> list of {content, title, reference} (best first)."""
+    phrases, seeds, edges, _visited = get_subgraph(question)
+    cands = kg_candidate_chunks(question, phrases, seeds, edges)
+    picked = kg_mmr_select(cands[:fetch_k], k, lambda_mult) if use_mmr else cands[:k]
+    return [{
+        "content": c["text"],
+        "title": c["title"],
+        "reference": KG_REF_BY_DOC.get(c["doc"], c["doc"]),
+    } for c in picked]
+
+
+def kg_predict(questions, **kwargs):
+    """One question (str) or many (list) ->
+       {"predictions": [{"data": [...]}, ...]}  - one prediction per question.
+       All names in this cell start with kg_/KG_ so no other cell can overwrite them."""
+    if isinstance(questions, str):
+        questions = [questions]
+    return {"predictions": [{"data": kg_graph_retrieve(q, **kwargs)} for q in questions]}
+
+
+# ----------------------------------------------------------
+# RUN
+# ----------------------------------------------------------
+QUERY = "What is meant by service operation in the context of Rolls-Royce product?"   # <- question
+
+kg_data = kg_graph_retrieve(QUERY)                    # list of {content, title, reference}
+response_kg = {"predictions": [{"data": kg_data}]}    # built here, so the format is guaranteed
+
+print(f"QUESTION : {QUERY}")
+print(f"settings : k={KG_RETRIEVE_K}, fetch_k={KG_FETCH_K}, lambda={KG_MMR_LAMBDA}")
+print(f"chunks   : {len(kg_data)}")
+print()
+for i, d in enumerate(kg_data, 1):
+    print(f"{i:2d}. {d['title']}  |  {d['reference']}")
+print()
+
+# full JSON (content shortened for display only - response_kg keeps the full text)
+preview = {"predictions": [{"data": [
+    {**d, "content": d["content"][:200] + ("..." if len(d["content"]) > 200 else "")}
+    for d in kg_data]}]}
+print(json.dumps(preview, indent=2, ensure_ascii=False))
+
+print("\nStored in: response_kg")
